@@ -1,0 +1,94 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper functions for Role-Based Access Control
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function getUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && getUserData().role == 'admin';
+    }
+
+    function isProvider() {
+      return isSignedIn() && (
+        getUserData().role == 'hospital' ||
+        getUserData().role == 'bloodBank' ||
+        getUserData().role == 'oxygenProvider' ||
+        getUserData().role == 'ambulanceProvider'
+      );
+    }
+
+    // Users Collection: users can read and edit their own doc, admins can read/manage all
+    match /users/{userId} {
+      allow read: if isOwner(userId) || isAdmin();
+      allow create: if isOwner(userId);
+      allow update: if isOwner(userId) || isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    // Emergency Cases: Patients create cases, authenticated providers and admins can read
+    match /cases/{caseId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn();
+      allow update: if isSignedIn();
+      allow delete: if isAdmin();
+    }
+
+    // Resource Requests: Patient and recipient provider can access and update
+    match /requests/{requestId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn();
+      allow update: if isSignedIn();
+      allow delete: if isAdmin();
+    }
+
+    // Provider Specific Profiles: Publicly readable for authenticated users (search/directory)
+    match /hospitalProfiles/{uid} {
+      allow read: if isSignedIn();
+      allow write: if isOwner(uid) || isAdmin();
+    }
+
+    match /bloodBankProfiles/{uid} {
+      allow read: if isSignedIn();
+      allow write: if isOwner(uid) || isAdmin();
+    }
+
+    match /oxygenProfiles/{uid} {
+      allow read: if isSignedIn();
+      allow write: if isOwner(uid) || isAdmin();
+    }
+
+    match /ambulanceProfiles/{uid} {
+      allow read: if isSignedIn();
+      allow write: if isOwner(uid) || isAdmin();
+    }
+
+    // Ambulance Trips: Tracked during emergency dispatch
+    match /ambulanceTrips/{tripId} {
+      allow read, write: if isSignedIn();
+    }
+
+    // Notifications: Recipient can read/update read state
+    match /notifications/{notifId} {
+      allow read, update: if isSignedIn() && resource.data.recipientUid == request.auth.uid;
+      allow create: if isSignedIn();
+      allow delete: if isAdmin();
+    }
+
+    // Clinical Notes: Recorded by attending physicians
+    match /clinicalNotes/{noteId} {
+      allow read, write: if isSignedIn();
+    }
+  }
+}
+
