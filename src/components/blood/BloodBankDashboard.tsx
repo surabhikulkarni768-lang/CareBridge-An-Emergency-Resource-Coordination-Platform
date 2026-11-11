@@ -63,16 +63,28 @@ export const BloodBankDashboard: React.FC = () => {
     }, 400);
   };
 
+  const isActionRequired = (status: string) => status === 'pending' || status === 'ASSIGNED' || status === 'REQUESTED';
+
   const handleAccept = (reqId: string) => {
+    const req = requests.find((r) => r.requestId === reqId);
+    if (!req) return;
+    const bg = req.details.bloodGroup as BloodGroup;
+    const units = req.details.units || 1;
+
+    if (bg && (inventory[bg] || 0) < units) {
+      alert(`Critical Shortage Alert: Requested ${units} units of ${bg}, but only ${inventory[bg] || 0} units are currently available in inventory. Please replenish stock or reject to notify Central Coordinator.`);
+      return;
+    }
+
     dataStore.respondToRequest(reqId, 'accepted');
-    setSuccessMessage('Blood request accepted. Inventory decremented & units reserved.');
+    setSuccessMessage(`Blood request accepted. ${units} units of ${bg} reserved & deducted from stock.`);
     setTimeout(() => setSuccessMessage(null), 3000);
   };
 
   const handleReject = (reqId: string) => {
     dataStore.respondToRequest(reqId, 'rejected', rejectionReason);
     setRejectingReqId(null);
-    setSuccessMessage('Blood request declined.');
+    setSuccessMessage('Blood request declined. Central Coordinator notified.');
     setTimeout(() => setSuccessMessage(null), 3000);
   };
 
@@ -249,7 +261,7 @@ export const BloodBankDashboard: React.FC = () => {
                 </div>
 
                 <div className="flex items-center gap-2 self-end sm:self-auto">
-                  {req.status === 'pending' ? (
+                  {isActionRequired(req.status) ? (
                     <>
                       <button
                         onClick={() => setRejectingReqId(req.requestId)}

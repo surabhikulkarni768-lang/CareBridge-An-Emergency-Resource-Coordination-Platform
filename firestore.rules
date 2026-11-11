@@ -19,36 +19,98 @@ service cloud.firestore {
       return isSignedIn() && getUserData().role == 'admin';
     }
 
+    function isProviderRole(role) {
+      return role == 'hospital' ||
+        role == 'bloodBank' ||
+        role == 'oxygenProvider' ||
+        role == 'ambulanceProvider' ||
+        role == 'doctor';
+    }
+
     function isProvider() {
-      return isSignedIn() && (
-        getUserData().role == 'hospital' ||
-        getUserData().role == 'bloodBank' ||
-        getUserData().role == 'oxygenProvider' ||
-        getUserData().role == 'ambulanceProvider'
-      );
+      return isSignedIn() && isProviderRole(getUserData().role);
     }
 
     // Users Collection: users can read and edit their own doc, admins can read/manage all
+    // Enforces zero-trust: non-admins CANNOT self-assign or modify role to 'admin' or provider
     match /users/{userId} {
       allow read: if isOwner(userId) || isAdmin();
-      allow create: if isOwner(userId);
-      allow update: if isOwner(userId) || isAdmin();
+      allow create: if isOwner(userId) && request.resource.data.role != 'admin' && !isProviderRole(request.resource.data.role);
+      allow update: if (isOwner(userId) && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['role']) || resource.data.role == request.resource.data.role)) || isAdmin();
       allow delete: if isAdmin();
     }
 
-    // Emergency Cases: Patients create cases, authenticated providers and admins can read
+    // Patient Links: attendants link and assist specific patients
+    // Explicit Patient Consent (consentGranted == true, consentStatus == 'granted') is REQUIRED
+    match /patientLinks/{linkId} {
+      allow read: if isSignedIn() && (
+        resource.data.attendantUid == request.auth.uid ||
+        resource.data.patientUid == request.auth.uid ||
+        isAdmin()
+      );
+      allow create: if isSignedIn() && (
+        (request.resource.data.attendantUid == request.auth.uid || request.resource.data.patientUid == request.auth.uid) &&
+        request.resource.data.consentGranted == true &&
+        request.resource.data.consentStatus == 'granted'
+      );
+      allow update: if isSignedIn() && (
+        resource.data.attendantUid == request.auth.uid ||
+        resource.data.patientUid == request.auth.uid ||
+        isAdmin()
+      );
+      allow delete: if isSignedIn() && (
+        resource.data.attendantUid == request.auth.uid ||
+        resource.data.patientUid == request.auth.uid ||
+        isAdmin()
+      );
+    }
+
+    // Emergency Cases: Patients/Attendants create cases, authorized participants, assigned providers, and admins can read/update
     match /cases/{caseId} {
-      allow read: if isSignedIn();
-      allow create: if isSignedIn();
-      allow update: if isSignedIn();
+      allow read: if isSignedIn() && (
+        resource.data.patientUid == request.auth.uid ||
+        resource.data.attendantUid == request.auth.uid ||
+        (resource.data.attendant != null && resource.data.attendant.uid == request.auth.uid) ||
+        resource.data.assignedHospitalUid == request.auth.uid ||
+        resource.data.assignedBloodBankUid == request.auth.uid ||
+        resource.data.assignedOxygenUid == request.auth.uid ||
+        resource.data.assignedAmbulanceUid == request.auth.uid ||
+        isProvider() ||
+        isAdmin()
+      );
+      allow create: if isSignedIn() && (
+        request.resource.data.patientUid == request.auth.uid ||
+        request.resource.data.attendantUid == request.auth.uid ||
+        (request.resource.data.attendant != null && request.resource.data.attendant.uid == request.auth.uid) ||
+        isAdmin()
+      );
+      allow update: if isSignedIn() && (
+        resource.data.patientUid == request.auth.uid ||
+        resource.data.attendantUid == request.auth.uid ||
+        resource.data.assignedHospitalUid == request.auth.uid ||
+        resource.data.assignedBloodBankUid == request.auth.uid ||
+        resource.data.assignedOxygenUid == request.auth.uid ||
+        resource.data.assignedAmbulanceUid == request.auth.uid ||
+        isAdmin()
+      );
       allow delete: if isAdmin();
     }
 
-    // Resource Requests: Patient and recipient provider can access and update
+    // Resource Requests: Patient, Attendant, and recipient provider can access and update
     match /requests/{requestId} {
-      allow read: if isSignedIn();
+      allow read: if isSignedIn() && (
+        resource.data.patientUid == request.auth.uid ||
+        resource.data.attendantUid == request.auth.uid ||
+        resource.data.providerUid == request.auth.uid ||
+        isAdmin()
+      );
       allow create: if isSignedIn();
-      allow update: if isSignedIn();
+      allow update: if isSignedIn() && (
+        resource.data.providerUid == request.auth.uid ||
+        resource.data.patientUid == request.auth.uid ||
+        resource.data.attendantUid == request.auth.uid ||
+        isAdmin()
+      );
       allow delete: if isAdmin();
     }
 
@@ -91,4 +153,3 @@ service cloud.firestore {
     }
   }
 }
-

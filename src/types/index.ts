@@ -5,12 +5,37 @@
 
 export type UserRole =
   | 'patient'
+  | 'patientAttendant'
+  | 'patient_attendant'
+  | 'attendant'
   | 'hospital'
   | 'bloodBank'
   | 'oxygenProvider'
   | 'ambulanceProvider'
   | 'doctor'
   | 'admin';
+
+export interface PatientLink {
+  id: string; // e.g. `${attendantUid}_${patientUid}` or generated UUID
+  attendantUid: string;
+  attendantName: string;
+  attendantEmail?: string;
+  patientUid: string;
+  patientName: string;
+  relationship: string; // e.g., 'Parent', 'Spouse', 'Child', 'Sibling', 'Relative', 'Ward', 'Other'
+  patientAge: number;
+  patientGender: string;
+  patientBloodGroup?: string;
+  emergencyContactPhone?: string;
+  medicalNotes?: string;
+  // Patient Consent Governance
+  consentGranted: boolean;
+  consentStatus: 'granted' | 'pending' | 'revoked';
+  consentDate: string;
+  consentType: 'explicit_patient_consent' | 'legal_guardian_consent' | 'emergency_proxy';
+  createdAt: string;
+  updatedAt: string;
+}
 
 export interface UserProfile {
   uid: string;
@@ -30,35 +55,115 @@ export interface UserProfile {
 }
 
 export type UrgencyLevel = 'immediate' | 'emergency' | 'urgent' | 'semi-urgent';
-export type CaseStatus = 'active' | 'resolved' | 'cancelled';
+export type EmergencyPriority = 'Critical' | 'High' | 'Medium' | 'Low';
+export type EmergencyCategory =
+  | 'Trauma / Accident'
+  | 'Cardiac Emergency'
+  | 'Respiratory Distress'
+  | 'Stroke / Neurological'
+  | 'Severe Bleeding / Hemorrhage'
+  | 'Maternal / Obstetric'
+  | 'Pediatric Emergency'
+  | 'General Acute Medical';
+
+export type CaseStatus =
+  | 'active'
+  | 'resolved'
+  | 'cancelled'
+  | 'REQUESTED'
+  | 'UNDER_REVIEW'
+  | 'ASSIGNED'
+  | 'ACCEPTED'
+  | 'RESOURCE_CONFIRMED'
+  | 'DISPATCHED'
+  | 'IN_PROGRESS'
+  | 'COMPLETED'
+  | 'REJECTED';
+
+export interface EmergencyAuditItem {
+  id: string;
+  status: CaseStatus;
+  updatedByUid: string;
+  updatedByName: string;
+  role: string;
+  timestamp: string;
+  note?: string;
+  reason?: string;
+}
+
+export interface ResourceQuotas {
+  bedRequired?: boolean;
+  icuRequired?: boolean;
+  bloodRequired?: boolean;
+  bloodGroup?: string;
+  bloodUnits?: number;
+  oxygenRequired?: boolean;
+  oxygenType?: 'cylinder' | 'concentrator' | 'both';
+  oxygenQuantity?: number;
+  ambulanceRequired?: boolean;
+  ambulanceType?: 'BLS' | 'ALS' | 'Patient Transport';
+}
 
 export interface EmergencyCase {
-  caseId: string; // e.g. CB-20261027-0042
+  caseId: string; // e.g. EMG-20261111-0042 or CB-20261027-0042
   patientUid: string;
+  attendantUid?: string; // Associated attendant UID
   patientName: string;
   patientAge: number;
   patientGender: string;
+  patientBloodGroup?: string;
+  category?: EmergencyCategory;
   conditionSummary: string;
   urgencyLevel: UrgencyLevel;
+  priority?: EmergencyPriority;
   resourcesNeeded: string[]; // ['bed', 'icu', 'blood', 'oxygen', 'ambulance']
+  quotas?: ResourceQuotas;
   location: {
     city: string;
     address: string;
     state?: string;
+    landmark?: string;
   };
+  contactPhone?: string;
   attendant?: {
+    uid?: string;
     name: string;
     relation: string;
     phone: string;
   };
   status: CaseStatus;
   requestCount: number;
+  assignedHospitalUid?: string;
+  assignedHospitalName?: string;
+  assignedBloodBankUid?: string;
+  assignedBloodBankName?: string;
+  assignedOxygenUid?: string;
+  assignedOxygenName?: string;
+  assignedAmbulanceUid?: string;
+  assignedAmbulanceName?: string;
+  estimatedResponseMinutes?: number;
+  auditHistory?: EmergencyAuditItem[];
+  rejectionReason?: string;
+  cancellationReason?: string;
   createdAt: string;
   updatedAt: string;
 }
 
 export type ResourceType = 'bed' | 'icu' | 'blood' | 'oxygen' | 'ambulance';
-export type RequestStatus = 'pending' | 'accepted' | 'rejected' | 'cancelled' | 'completed';
+export type RequestStatus =
+  | 'pending'
+  | 'accepted'
+  | 'rejected'
+  | 'cancelled'
+  | 'completed'
+  | 'REQUESTED'
+  | 'UNDER_REVIEW'
+  | 'ASSIGNED'
+  | 'ACCEPTED'
+  | 'RESOURCE_CONFIRMED'
+  | 'DISPATCHED'
+  | 'IN_PROGRESS'
+  | 'COMPLETED';
 
 export interface ResourceRequest {
   requestId: string; // REQ-YYYYMMDD-XXXX
@@ -78,6 +183,7 @@ export interface ResourceRequest {
     notes?: string;
     pickupAddress?: string;
     destinationAddress?: string;
+    estimatedResponseTimeMinutes?: number;
   };
   status: RequestStatus;
   rejectionReason?: string;

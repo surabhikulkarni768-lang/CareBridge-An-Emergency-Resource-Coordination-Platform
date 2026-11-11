@@ -45,7 +45,7 @@ interface AuthContextType {
   updateProfile: (updates: Partial<UserProfile>) => Promise<void>;
 }
 
-const AuthContext = createContext<AuthContextType | undefined>(undefined);
+export const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
 export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
   const [currentUser, setCurrentUser] = useState<UserProfile | null>(null);
@@ -109,6 +109,13 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
             dataStore.saveUser(userProfile);
           }
 
+          if (userProfile) {
+            if (userProfile.email?.toLowerCase() === 'sahana2006@gmail.com') {
+              userProfile.displayName = userProfile.displayName || 'Sahana S.';
+              userProfile.role = 'patientAttendant';
+            }
+          }
+
           setCurrentUser(userProfile);
         } catch (e: any) {
           console.error('[CareBridge Auth] Error resolving user profile:', e);
@@ -165,6 +172,11 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
             await setDoc(doc(db, 'users', cred.user.uid), profile);
           }
           dataStore.saveUser(profile);
+        }
+
+        if (profile.email?.toLowerCase() === 'sahana2006@gmail.com') {
+          profile.displayName = profile.displayName || 'Sahana S.';
+          profile.role = 'patientAttendant';
         }
 
         if (!profile.isActive) {
@@ -399,8 +411,25 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   );
 };
 
+
+export const defaultAuthContext: AuthContextType = {
+  currentUser: null,
+  firebaseUser: null,
+  activeRole: null,
+  isAuthenticated: false,
+  loading: false,
+  error: null,
+  login: async () => false,
+  signup: async () => ({ success: false, error: 'AuthProvider not initialized' }),
+  resetPassword: async () => ({ success: false, error: 'AuthProvider not initialized' }),
+  logout: async () => {},
+  updateProfile: async () => {},
+};
+
 export const useAuth = () => {
   const ctx = useContext(AuthContext);
-  if (!ctx) throw new Error('useAuth must be used within an AuthProvider');
+  if (!ctx) {
+    return defaultAuthContext;
+  }
   return ctx;
 };

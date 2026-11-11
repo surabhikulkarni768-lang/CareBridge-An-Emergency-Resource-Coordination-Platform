@@ -84,12 +84,15 @@ export const HospitalDashboard: React.FC = () => {
     setTimeout(() => setSuccessMessage(null), 3000);
   };
 
+  const isActionRequired = (status: string) => status === 'pending' || status === 'ASSIGNED' || status === 'REQUESTED';
+
   const filteredRequests = requests.filter((r) => {
     if (filter === 'all') return true;
+    if (filter === 'pending') return isActionRequired(r.status);
     return r.status === filter;
   });
 
-  const pendingCount = requests.filter((r) => r.status === 'pending').length;
+  const pendingCount = requests.filter((r) => isActionRequired(r.status)).length;
 
   if (!profile) {
     return <div className="p-8 text-center text-slate-500">Loading Hospital Provider Dashboard...</div>;
@@ -325,9 +328,9 @@ export const HospitalDashboard: React.FC = () => {
 
                         {/* Status Badge */}
                         <div>
-                          {req.status === 'pending' && (
+                          {isActionRequired(req.status) && (
                             <span className="inline-flex items-center gap-1 text-xs font-bold text-amber-700 bg-amber-100 px-2.5 py-1 rounded-full">
-                              <Clock className="w-3.5 h-3.5" /> Action Required
+                              <Clock className="w-3.5 h-3.5" /> Action Required ({req.status})
                             </span>
                           )}
                           {req.status === 'accepted' && (
@@ -361,7 +364,7 @@ export const HospitalDashboard: React.FC = () => {
                       )}
 
                       {/* Action Buttons for Pending */}
-                      {req.status === 'pending' && (
+                      {isActionRequired(req.status) && (
                         <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-200">
                           <button
                             onClick={() => setRejectingReqId(req.requestId)}
