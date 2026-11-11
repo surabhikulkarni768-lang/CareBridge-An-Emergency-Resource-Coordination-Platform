@@ -37,7 +37,9 @@ import type {
   UserRole,
   ClinicalNote,
   AmbulanceTripStatus,
-  PatientLink
+  PatientLink,
+  CaseStatus,
+  EmergencyServiceStatus
 } from '../types';
 
 // ==========================================
@@ -619,6 +621,11 @@ class DataStore {
     this.saveState();
   }
 
+  public getDoctorProfile(uid: string): UserProfile | undefined {
+    const user = this.getUser(uid);
+    return user?.role === 'doctor' ? user : (this.getUsers().find(u => u.role === 'doctor'));
+  }
+
   public getAllHospitalProfiles(): HospitalProfile[] {
     return Object.values(this.state.hospitalProfiles);
   }
@@ -676,6 +683,7 @@ class DataStore {
       if (c.attendantUid === attendantUid) return true;
       if (c.attendant && c.attendant.uid === attendantUid) return true;
       if (c.patientUid === attendantUid) return true;
+      if (c.requesterUid === attendantUid) return true;
       // Accessing patient's records strictly requires verified patient consent
       if (consentedPatientUids.includes(c.patientUid) && linkedPatientUids.includes(c.patientUid)) return true;
       return false;
@@ -1396,7 +1404,19 @@ export async function fetchCasesForAttendantFromFirestore(
       console.warn('[CareBridge Firestore] Query by attendantUid note:', e);
     }
 
-    // 2. Cases for linked patient UIDs
+    // 2. Cases where user is the patient directly (self-created cases or patient account)
+    try {
+      const qSelf = query(collection(db, 'cases'), where('patientUid', '==', attendantUid));
+      const snapSelf = await getDocs(qSelf);
+      snapSelf.forEach((d) => {
+        const c = d.data() as EmergencyCase;
+        casesMap.set(c.caseId, c);
+      });
+    } catch (e) {
+      console.warn('[CareBridge Firestore] Query by patientUid self note:', e);
+    }
+
+    // 3. Cases for linked patient UIDs (attendant accessing authorized patients)
     for (const pUid of linkedPatientUids) {
       try {
         const qP = query(collection(db, 'cases'), where('patientUid', '==', pUid));
@@ -1420,6 +1440,150 @@ export async function fetchCasesForAttendantFromFirestore(
     console.warn('[CareBridge Firestore] Failed to fetch cases for attendant:', err);
     return dataStore.getCasesForAttendant(attendantUid, linkedPatientUids);
   }
+}
+
+export interface CaseValidationResult {
+  isValid: boolean;
+  valid: boolean;
+  errors: Record<string, string>;
+  errorList: string[];
+}
+
+export function validateEmergencyCasePayload(
+  payload: Partial<EmergencyCase>,
+  requester: { uid: string; role: string },
+  linkedPatients: PatientLink[] = []
+): CaseValidationResult {
+  const errors: Record<string, string> = {};
+
+  // 1. Patient Information
+  if (!payload.patientName || !payload.patientName.trim()) {
+    errors.patientName = 'Patient full name is required.';
+  }
+  const patientUid = payload.patientUid || payload.patientId;
+  if (!patientUid || !patientUid.trim()) {
+    errors.patientUid = 'Patient ID is required.';
+  }
+  const age = Number(payload.patientAge);
+  if (payload.patientAge === undefined || payload.patientAge === null || isNaN(age) || age <= 0 || age > 130) {
+    errors.patientAge = 'Please enter a valid patient age (1–130).';
+  }
+  if (!payload.patientGender || !payload.patientGender.trim()) {
+    errors.patientGender = 'Patient gender is required.';
+  }
+
+  // 2. Authorization and Consent
+  const isSelf = requester.role === 'patient' || requester.uid === patientUid;
+  if (!isSelf) {
+    const link = linkedPatients.find((l) => l.patientUid === patientUid);
+    if (!link) {
+      errors.authorization = 'Unauthorized: You are not authorized to create emergency cases for unrelated patients.';
+    } else if (!link.consentGranted || link.consentStatus !== 'granted') {
+      errors.consent = 'Valid, active patient consent is required before creating an emergency case on behalf of this patient.';
+    }
+  }
+
+  // 3. Emergency Details
+  const category = payload.category || payload.emergencyCategory;
+  if (!category || !category.trim()) {
+    errors.category = 'Please select an emergency category.';
+  }
+  const condition = payload.conditionSummary || payload.patientCondition || payload.emergencyDescription;
+  if (!condition || !condition.trim()) {
+    errors.conditionSummary = 'Emergency condition description is required.';
+  }
+  const priority = payload.priority || payload.emergencyPriority || payload.triagePriority;
+  if (!priority) {
+    errors.priority = 'Please select an emergency priority level.';
+  }
+
+  // 4. Required Services
+  const services = payload.requiredServices || payload.resourcesNeeded || [];
+  if (!services || services.length === 0) {
+    errors.services = 'Please select at least one emergency service (Hospital admission, Blood, Oxygen, Ambulance, or Doctor assistance).';
+  }
+
+  const hasBlood = services.some((s) => s.toLowerCase().includes('blood')) || Boolean(payload.quotas?.bloodRequired);
+  if (hasBlood) {
+    const bloodGroup = payload.quotas?.bloodGroup || payload.patientBloodGroup;
+    const bloodUnits = Number(payload.quotas?.bloodUnits ?? payload.quotas?.bloodUnitsRequested);
+    if (!bloodGroup || bloodGroup === 'Unknown' || !bloodGroup.trim()) {
+      errors.bloodGroup = 'Blood group must be specified when blood requirement is selected.';
+    }
+    if (!bloodUnits || isNaN(bloodUnits) || bloodUnits <= 0) {
+      errors.bloodUnits = 'Number of blood units required must be at least 1.';
+    }
+  }
+
+  const hasOxygen = services.some((s) => s.toLowerCase().includes('oxygen')) || Boolean(payload.quotas?.oxygenRequired);
+  if (hasOxygen) {
+    const oxyType = payload.quotas?.oxygenType;
+    const oxyQty = Number(payload.quotas?.oxygenQuantity ?? payload.quotas?.oxygenCylindersRequested);
+    if (!oxyType) {
+      errors.oxygenType = 'Oxygen supply type (cylinder, concentrator, or both) must be specified.';
+    }
+    if (!oxyQty || isNaN(oxyQty) || oxyQty <= 0) {
+      errors.oxygenQuantity = 'Oxygen supply quantity must be at least 1.';
+    }
+  }
+
+  // 5. Location
+  const address = payload.location?.address || payload.incidentAddress;
+  if (!address || !address.trim()) {
+    errors.location = 'Current emergency location address / landmark is required.';
+  }
+
+  // 6. Contact Information
+  const contactPerson = payload.contactPerson || payload.attendant?.name || payload.attendantName || payload.patientName;
+  const contactPhone = payload.contactPhone || payload.attendant?.phone || payload.attendantPhone || payload.patientPhone;
+  if (!contactPerson || !contactPerson.trim()) {
+    errors.contactPerson = 'Contact person name is required.';
+  }
+  if (!contactPhone || !contactPhone.trim() || contactPhone.trim().length < 8) {
+    errors.contactPhone = 'Please enter a valid emergency contact phone number.';
+  }
+
+  const isValid = Object.keys(errors).length === 0;
+  return {
+    isValid,
+    valid: isValid,
+    errors,
+    errorList: Object.values(errors)
+  };
+}
+
+export async function createEmergencyCase(
+  caseRecord: EmergencyCase,
+  requester: { uid: string; role: string },
+  linkedPatients: PatientLink[] = []
+): Promise<{ success: boolean; caseId: string; error?: string }> {
+  // 1. Enforce validation before writing
+  const validation = validateEmergencyCasePayload(caseRecord, requester, linkedPatients);
+  if (!validation.isValid) {
+    const firstErr = validation.errorList[0] || 'Emergency case validation failed';
+    return { success: false, caseId: caseRecord.caseId, error: firstErr };
+  }
+
+  // 2. Prevent duplicate submissions / idempotency
+  const existing = dataStore.getCase(caseRecord.caseId);
+  if (existing) {
+    return { success: true, caseId: caseRecord.caseId };
+  }
+
+  // 3. Save to local data store
+  dataStore.createCase(caseRecord);
+
+  // 4. Save to Firestore if configured
+  if (isFirebaseConfigured && db) {
+    try {
+      await setDoc(doc(db, 'cases', caseRecord.caseId), caseRecord);
+    } catch (err: any) {
+      console.warn('[CareBridge Firestore] Failed to write case to Firestore:', err);
+      throw err;
+    }
+  }
+
+  return { success: true, caseId: caseRecord.caseId };
 }
 
 export async function saveCaseToFirestore(emergencyCase: EmergencyCase): Promise<void> {

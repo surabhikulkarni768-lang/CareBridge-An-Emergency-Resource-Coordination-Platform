@@ -65,12 +65,22 @@ service cloud.firestore {
       );
     }
 
+    function hasValidPatientConsent(attendantUid, patientUid) {
+      let linkPath = /databases/$(database)/documents/patientLinks/$(attendantUid + '_' + patientUid);
+      return exists(linkPath) &&
+        get(linkPath).data.consentGranted == true &&
+        get(linkPath).data.consentStatus == 'granted' &&
+        get(linkPath).data.attendantUid == attendantUid &&
+        get(linkPath).data.patientUid == patientUid;
+    }
+
     // Emergency Cases: Patients/Attendants create cases, authorized participants, assigned providers, and admins can read/update
     match /cases/{caseId} {
       allow read: if isSignedIn() && (
         resource.data.patientUid == request.auth.uid ||
         resource.data.attendantUid == request.auth.uid ||
         (resource.data.attendant != null && resource.data.attendant.uid == request.auth.uid) ||
+        resource.data.requesterUid == request.auth.uid ||
         resource.data.assignedHospitalUid == request.auth.uid ||
         resource.data.assignedBloodBankUid == request.auth.uid ||
         resource.data.assignedOxygenUid == request.auth.uid ||
@@ -78,15 +88,24 @@ service cloud.firestore {
         isProvider() ||
         isAdmin()
       );
+      // Case Creation:
+      // 1. Patient creating an emergency request for themselves (patientUid == auth.uid)
+      // 2. Authorized Patient Attendant creating for a linked patient ONLY when valid patient consent exists
+      // 3. Central admin
       allow create: if isSignedIn() && (
-        request.resource.data.patientUid == request.auth.uid ||
-        request.resource.data.attendantUid == request.auth.uid ||
-        (request.resource.data.attendant != null && request.resource.data.attendant.uid == request.auth.uid) ||
+        (request.resource.data.patientUid == request.auth.uid) ||
+        (
+          (request.resource.data.attendantUid == request.auth.uid ||
+           (request.resource.data.attendant != null && request.resource.data.attendant.uid == request.auth.uid) ||
+           request.resource.data.requesterUid == request.auth.uid) &&
+          hasValidPatientConsent(request.auth.uid, request.resource.data.patientUid)
+        ) ||
         isAdmin()
       );
       allow update: if isSignedIn() && (
         resource.data.patientUid == request.auth.uid ||
         resource.data.attendantUid == request.auth.uid ||
+        resource.data.requesterUid == request.auth.uid ||
         resource.data.assignedHospitalUid == request.auth.uid ||
         resource.data.assignedBloodBankUid == request.auth.uid ||
         resource.data.assignedOxygenUid == request.auth.uid ||
@@ -104,7 +123,12 @@ service cloud.firestore {
         resource.data.providerUid == request.auth.uid ||
         isAdmin()
       );
-      allow create: if isSignedIn();
+      allow create: if isSignedIn() && (
+        request.resource.data.patientUid == request.auth.uid ||
+        request.resource.data.attendantUid == request.auth.uid ||
+        hasValidPatientConsent(request.auth.uid, request.resource.data.patientUid) ||
+        isAdmin()
+      );
       allow update: if isSignedIn() && (
         resource.data.providerUid == request.auth.uid ||
         resource.data.patientUid == request.auth.uid ||

@@ -26,13 +26,14 @@ export interface PatientLink {
   patientAge: number;
   patientGender: string;
   patientBloodGroup?: string;
+  patientPhone?: string;
   emergencyContactPhone?: string;
   medicalNotes?: string;
   // Patient Consent Governance
   consentGranted: boolean;
   consentStatus: 'granted' | 'pending' | 'revoked';
-  consentDate: string;
-  consentType: 'explicit_patient_consent' | 'legal_guardian_consent' | 'emergency_proxy';
+  consentDate?: string;
+  consentType?: 'explicit_patient_consent' | 'legal_guardian_consent' | 'emergency_proxy';
   createdAt: string;
   updatedAt: string;
 }
@@ -57,6 +58,12 @@ export interface UserProfile {
 export type UrgencyLevel = 'immediate' | 'emergency' | 'urgent' | 'semi-urgent';
 export type EmergencyPriority = 'Critical' | 'High' | 'Medium' | 'Low';
 export type EmergencyCategory =
+  | 'Accident'
+  | 'Cardiac emergency'
+  | 'Respiratory emergency'
+  | 'Medical emergency'
+  | 'Trauma'
+  | 'Other'
   | 'Trauma / Accident'
   | 'Cardiac Emergency'
   | 'Respiratory Distress'
@@ -67,6 +74,13 @@ export type EmergencyCategory =
   | 'General Acute Medical';
 
 export type CaseStatus =
+  | 'Submitted'
+  | 'Under Review'
+  | 'Accepted'
+  | 'Rejected'
+  | 'In Progress'
+  | 'Completed'
+  | 'Cancelled'
   | 'active'
   | 'resolved'
   | 'cancelled'
@@ -93,46 +107,92 @@ export interface EmergencyAuditItem {
 
 export interface ResourceQuotas {
   bedRequired?: boolean;
+  hospitalBedsRequired?: number;
   icuRequired?: boolean;
   bloodRequired?: boolean;
   bloodGroup?: string;
   bloodUnits?: number;
+  bloodUnitsRequested?: number;
   oxygenRequired?: boolean;
   oxygenType?: 'cylinder' | 'concentrator' | 'both';
   oxygenQuantity?: number;
+  oxygenCylindersRequested?: number;
   ambulanceRequired?: boolean;
   ambulanceType?: 'BLS' | 'ALS' | 'Patient Transport';
+  doctorRequired?: boolean;
+  doctorType?: string;
+  notes?: string;
+}
+
+export interface EmergencyServiceStatus {
+  serviceName?: string;
+  status: 'Submitted' | 'Under Review' | 'Accepted' | 'Rejected' | 'In Progress' | 'Completed' | 'Cancelled' | 'Not Requested' | 'pending' | 'dispatched' | string;
+  detail?: string;
+  providerName?: string;
+  updatedAt?: string;
 }
 
 export interface EmergencyCase {
   caseId: string; // e.g. EMG-20261111-0042 or CB-20261027-0042
   patientUid: string;
-  attendantUid?: string; // Associated attendant UID
+  patientId?: string; // Explicit patient ID alias for audit and indexing
+  requesterUid?: string; // UID of user who created the request (patient or attendant)
+  requesterRole?: UserRole; // Role of user who created the request
+  createdBy?: 'patient' | 'attendant'; // Origin classification
+  attendantUid?: string; // Associated attendant UID if created by or linked to an attendant
   patientName: string;
-  patientAge: number;
+  patientAge: number | string;
   patientGender: string;
   patientBloodGroup?: string;
+  patientPhone?: string;
   category?: EmergencyCategory;
-  conditionSummary: string;
-  urgencyLevel: UrgencyLevel;
+  emergencyCategory?: EmergencyCategory;
+  conditionSummary?: string;
+  patientCondition?: string;
+  emergencyDescription?: string;
+  urgencyLevel?: UrgencyLevel;
   priority?: EmergencyPriority;
-  resourcesNeeded: string[]; // ['bed', 'icu', 'blood', 'oxygen', 'ambulance']
+  emergencyPriority?: EmergencyPriority;
+  triagePriority?: string;
+  requiredServices?: string[]; // ['Hospital admission', 'Blood requirement', 'Oxygen supply', 'Ambulance', 'Doctor assistance']
+  resourcesNeeded?: string[]; // ['bed', 'icu', 'blood', 'oxygen', 'ambulance', 'doctor']
   quotas?: ResourceQuotas;
-  location: {
-    city: string;
+  location?: {
+    city?: string;
     address: string;
     state?: string;
     landmark?: string;
+    coordinates?: {
+      lat: number;
+      lng: number;
+    };
   };
+  incidentAddress?: string;
+  incidentCoordinates?: {
+    lat: number;
+    lng: number;
+  };
+  contactPerson?: string;
   contactPhone?: string;
+  notes?: string;
   attendant?: {
     uid?: string;
     name: string;
     relation: string;
     phone: string;
   };
+  attendantName?: string;
+  attendantRelation?: string;
+  attendantPhone?: string;
+  providerName?: string;
+  resourcesList?: string[];
+  individualStatuses?: Array<{ resource: string; detail: string; status: string }>;
+  dateStr?: string;
+  createdTimestamp?: number;
+  updatedTimestamp?: number;
   status: CaseStatus;
-  requestCount: number;
+  requestCount?: number;
+  serviceStatuses?: Record<string, EmergencyServiceStatus | string>;
   assignedHospitalUid?: string;
   assignedHospitalName?: string;
   assignedBloodBankUid?: string;
@@ -146,11 +206,18 @@ export interface EmergencyCase {
   rejectionReason?: string;
   cancellationReason?: string;
   createdAt: string;
-  updatedAt: string;
+  updatedAt?: string;
 }
 
-export type ResourceType = 'bed' | 'icu' | 'blood' | 'oxygen' | 'ambulance';
+export type ResourceType = 'bed' | 'icu' | 'blood' | 'oxygen' | 'ambulance' | 'doctor' | 'hospital_admission' | 'doctor_assistance';
 export type RequestStatus =
+  | 'Submitted'
+  | 'Under Review'
+  | 'Accepted'
+  | 'Rejected'
+  | 'In Progress'
+  | 'Completed'
+  | 'Cancelled'
   | 'pending'
   | 'accepted'
   | 'rejected'
@@ -179,6 +246,10 @@ export interface ResourceRequest {
     units?: number;
     cylinders?: number;
     concentrators?: number;
+    oxygenType?: string;
+    doctorType?: string;
+    specialty?: string;
+    urgency?: string;
     vehicleType?: string;
     notes?: string;
     pickupAddress?: string;

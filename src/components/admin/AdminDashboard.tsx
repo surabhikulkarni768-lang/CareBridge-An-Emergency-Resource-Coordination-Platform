@@ -881,11 +881,15 @@ export const AdminDashboard: React.FC = () => {
                   className="w-full text-xs p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-slate-900 font-medium"
                 >
                   <option value="">Do Not Assign Blood Bank</option>
-                  {bloodBanks.map((b) => (
-                    <option key={b.uid} value={b.uid}>
-                      {b.bankName} (Group {selectedCase.patientBloodGroup || 'O+'}: {b.inventory[selectedCase.patientBloodGroup as any] || 0} units)
-                    </option>
-                  ))}
+                  {bloodBanks.map((b) => {
+                    const groupKey = (selectedCase.patientBloodGroup || 'O+') as any;
+                    const availableUnits = (b.inventory as Record<string, number>)?.[groupKey] ?? 0;
+                    return (
+                      <option key={b.uid} value={b.uid}>
+                        {b.bankName} (Group {selectedCase.patientBloodGroup || 'O+'}: {availableUnits} units)
+                      </option>
+                    );
+                  })}
                 </select>
               </div>
 
