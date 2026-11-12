@@ -14,7 +14,7 @@ import {
   Building2
 } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
-import { dataStore } from '../../services/dataService';
+import { dataStore, respondToRequestInFirestore, subscribeRequestsForProviderFromFirestore } from '../../services/dataService';
 import type { BloodBankProfile, ResourceRequest, BloodGroup } from '../../types';
 
 export const BloodBankDashboard: React.FC = () => {
@@ -36,13 +36,17 @@ export const BloodBankDashboard: React.FC = () => {
       setProfile(prof);
       setInventory(prof.inventory);
     }
-    setRequests(dataStore.getRequestsForProvider(currentUser.uid));
   };
 
   useEffect(() => {
+    if (!currentUser) return;
     loadData();
-    const unsub = dataStore.subscribe(loadData);
-    return () => unsub();
+    const unsubscribeStore = dataStore.subscribe(loadData);
+    const unsubscribeRequests = subscribeRequestsForProviderFromFirestore(currentUser.uid, setRequests);
+    return () => {
+      unsubscribeStore();
+      unsubscribeRequests();
+    };
   }, [currentUser]);
 
   const handleUnitChange = (group: BloodGroup, delta: number) => {
@@ -65,7 +69,7 @@ export const BloodBankDashboard: React.FC = () => {
 
   const isActionRequired = (status: string) => status === 'pending' || status === 'ASSIGNED' || status === 'REQUESTED';
 
-  const handleAccept = (reqId: string) => {
+  const handleAccept = async (reqId: string) => {
     const req = requests.find((r) => r.requestId === reqId);
     if (!req) return;
     const bg = req.details.bloodGroup as BloodGroup;
@@ -76,16 +80,24 @@ export const BloodBankDashboard: React.FC = () => {
       return;
     }
 
-    dataStore.respondToRequest(reqId, 'accepted');
-    setSuccessMessage(`Blood request accepted. ${units} units of ${bg} reserved & deducted from stock.`);
-    setTimeout(() => setSuccessMessage(null), 3000);
+    try {
+      await respondToRequestInFirestore(reqId, 'accepted');
+      setSuccessMessage(`Blood request accepted. ${units} units of ${bg} reserved & deducted from stock.`);
+      setTimeout(() => setSuccessMessage(null), 3000);
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : 'Could not respond to the request.');
+    }
   };
 
-  const handleReject = (reqId: string) => {
-    dataStore.respondToRequest(reqId, 'rejected', rejectionReason);
-    setRejectingReqId(null);
-    setSuccessMessage('Blood request declined. Central Coordinator notified.');
-    setTimeout(() => setSuccessMessage(null), 3000);
+  const handleReject = async (reqId: string) => {
+    try {
+      await respondToRequestInFirestore(reqId, 'rejected', rejectionReason);
+      setRejectingReqId(null);
+      setSuccessMessage('Blood request declined. Central Coordinator notified.');
+      setTimeout(() => setSuccessMessage(null), 3000);
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : 'Could not respond to the request.');
+    }
   };
 
   if (!profile) {
@@ -294,4 +306,3 @@ export const BloodBankDashboard: React.FC = () => {
     </div>
   );
 };
-

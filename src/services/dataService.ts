@@ -1478,6 +1478,17 @@ class DataStore {
     return this.state.requests.filter((r) => r.providerUid === providerUid);
   }
 
+  public replaceRequestsForProvider(providerUid: string, requests: ResourceRequest[]) {
+    const requestIds = new Set(requests.map((request) => request.requestId));
+    this.state.requests = [
+      ...requests,
+      ...this.state.requests.filter((request) =>
+        request.providerUid !== providerUid && !requestIds.has(request.requestId)
+      )
+    ];
+    this.saveState();
+  }
+
   public createRequest(req: ResourceRequest) {
     const isNewRequest = !this.state.requests.some((request) => request.requestId === req.requestId);
     this.state.requests = this.state.requests.filter((request) => request.requestId !== req.requestId);
@@ -2164,4 +2175,80 @@ export async function fetchRequestsForCasesFromFirestore(caseIds: string[]): Pro
     console.warn('[CareBridge Firestore] Failed to fetch requests for cases:', err);
     return dataStore.getRequests().filter((r) => caseIds.includes(r.caseId));
   }
+}
+
+export function subscribeRequestsForProviderFromFirestore(
+  providerUid: string,
+  onUpdate: (requests: ResourceRequest[]) => void
+): Unsubscribe {
+  if (!isFirebaseConfigured || !db) {
+    onUpdate(dataStore.getRequestsForProvider(providerUid));
+    return dataStore.subscribe(() => {
+      onUpdate(dataStore.getRequestsForProvider(providerUid));
+    });
+  }
+
+  try {
+    return onSnapshot(
+      query(collection(db, 'requests'), where('providerUid', '==', providerUid)),
+      (snapshot) => {
+        try {
+          const requests = snapshot.docs.map((requestSnapshot) => {
+            const data = requestSnapshot.data();
+            const createdAt = firestoreDateToIso(data.createdAt);
+            return {
+              ...data,
+              requestId: data.requestId || requestSnapshot.id,
+              createdAt,
+              updatedAt: data.updatedAt ? firestoreDateToIso(data.updatedAt) : createdAt,
+              respondedAt: data.respondedAt ? firestoreDateToIso(data.respondedAt) : undefined
+            } as ResourceRequest;
+          });
+          requests.sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+          dataStore.replaceRequestsForProvider(providerUid, requests);
+          onUpdate(requests);
+        } catch (error) {
+          console.warn('[CareBridge Firestore] Could not parse provider requests:', error);
+          dataStore.replaceRequestsForProvider(providerUid, []);
+          onUpdate([]);
+        }
+      },
+      (error) => {
+        console.warn('[CareBridge Firestore] Could not load provider requests:', error);
+        dataStore.replaceRequestsForProvider(providerUid, []);
+        onUpdate([]);
+      }
+    );
+  } catch (error) {
+    console.warn('[CareBridge Firestore] Could not subscribe to provider requests:', error);
+    onUpdate([]);
+    return () => undefined;
+  }
+}
+
+export async function respondToRequestInFirestore(
+  requestId: string,
+  status: 'accepted' | 'rejected' | 'completed',
+  reason?: string
+): Promise<void> {
+  const request = dataStore.getRequests().find((item) => item.requestId === requestId);
+  if (!request) {
+    throw new Error('This resource request is no longer available.');
+  }
+
+  if (isFirebaseConfigured && db) {
+    if (auth.currentUser?.uid !== request.providerUid) {
+      throw new Error('Only the assigned provider can respond to this request.');
+    }
+
+    const respondedAt = new Date().toISOString();
+    await updateDoc(doc(db, 'requests', requestId), {
+      status,
+      respondedAt,
+      updatedAt: respondedAt,
+      ...(reason ? { rejectionReason: reason } : {})
+    });
+  }
+
+  dataStore.respondToRequest(requestId, status, reason);
 }

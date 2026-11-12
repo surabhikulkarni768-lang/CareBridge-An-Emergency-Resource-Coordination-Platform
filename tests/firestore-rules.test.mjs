@@ -135,6 +135,14 @@ const stranger = await createAccount('stranger', 'patient');
 const assignedProvider = await createAccount('assigned-provider', 'bloodBank');
 const unassignedProvider = await createAccount('unassigned-provider', 'bloodBank');
 const admin = await createAccount('admin', 'admin');
+const suspendedPatient = await createAccount('suspended-patient', 'patient');
+await seed(`users/${suspendedPatient.uid}`, {
+  uid: suspendedPatient.uid,
+  email: 'suspended-patient@rules.test',
+  role: 'patient',
+  isActive: false,
+  isVerified: true
+});
 await seed(`providerDirectory/${assignedProvider.uid}`, {
   uid: assignedProvider.uid,
   role: 'bloodBank',
@@ -212,6 +220,31 @@ try {
     assert.equal(savedCase.data.fields.patientUid.stringValue, patient.uid);
     assert.equal(savedRequest.data.fields.caseId.stringValue, caseId);
     assert.equal(savedRequest.data.fields.requesterUid.stringValue, patient.uid);
+  });
+
+  await check('Suspended patient cannot create a case or atomic case/request batch', async () => {
+    const suspendedCaseId = `${caseId}-SUSPENDED`;
+    const suspendedCase = {
+      ...caseDocument,
+      caseId: suspendedCaseId,
+      patientUid: suspendedPatient.uid,
+      requesterUid: suspendedPatient.uid
+    };
+    const caseResult = await createDocument(`cases/${suspendedCaseId}`, suspendedCase, suspendedPatient.token);
+    assert.equal(caseResult.status, 403, JSON.stringify(caseResult.data));
+
+    const suspendedRequest = {
+      ...requestDocument,
+      requestId: `REQ-${suspendedCaseId}-blood`,
+      caseId: suspendedCaseId,
+      patientUid: suspendedPatient.uid,
+      requesterUid: suspendedPatient.uid
+    };
+    const batchResult = await batchCommit(suspendedPatient.token, [
+      updateWrite(`cases/${suspendedCaseId}`, suspendedCase),
+      updateWrite(`requests/${suspendedRequest.requestId}`, suspendedRequest)
+    ]);
+    assert.equal(batchResult.status, 403, JSON.stringify(batchResult.data));
   });
 
   await check('Attendant collection-group query returns only their active consent links', async () => {

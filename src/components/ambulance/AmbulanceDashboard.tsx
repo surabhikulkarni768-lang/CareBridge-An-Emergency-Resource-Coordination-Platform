@@ -15,7 +15,7 @@ import {
   AlertCircle
 } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
-import { dataStore } from '../../services/dataService';
+import { dataStore, respondToRequestInFirestore, subscribeRequestsForProviderFromFirestore } from '../../services/dataService';
 import type { AmbulanceProfile, ResourceRequest, AmbulanceTrip, AmbulanceTripStatus, AmbulanceVehicle } from '../../types';
 
 export const AmbulanceDashboard: React.FC = () => {
@@ -36,14 +36,18 @@ export const AmbulanceDashboard: React.FC = () => {
     if (!currentUser) return;
     const prof = dataStore.getAmbulanceProfile(currentUser.uid);
     if (prof) setProfile(prof);
-    setRequests(dataStore.getRequestsForProvider(currentUser.uid));
     setTrips(dataStore.getTrips().filter((t) => t.providerUid === currentUser.uid));
   };
 
   useEffect(() => {
+    if (!currentUser) return;
     loadData();
-    const unsub = dataStore.subscribe(loadData);
-    return () => unsub();
+    const unsubscribeStore = dataStore.subscribe(loadData);
+    const unsubscribeRequests = subscribeRequestsForProviderFromFirestore(currentUser.uid, setRequests);
+    return () => {
+      unsubscribeStore();
+      unsubscribeRequests();
+    };
   }, [currentUser]);
 
   const handleAddVehicle = (e: React.FormEvent) => {
@@ -64,16 +68,24 @@ export const AmbulanceDashboard: React.FC = () => {
     setTimeout(() => setSuccessMessage(null), 3000);
   };
 
-  const handleAcceptRequest = (reqId: string) => {
-    dataStore.respondToRequest(reqId, 'accepted');
-    setSuccessMessage('Ambulance dispatched! Trip telemetry initiated.');
-    setTimeout(() => setSuccessMessage(null), 3000);
+  const handleAcceptRequest = async (reqId: string) => {
+    try {
+      await respondToRequestInFirestore(reqId, 'accepted');
+      setSuccessMessage('Ambulance dispatched! Trip telemetry initiated.');
+      setTimeout(() => setSuccessMessage(null), 3000);
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : 'Could not respond to the request.');
+    }
   };
 
-  const handleRejectRequest = (reqId: string) => {
-    dataStore.respondToRequest(reqId, 'rejected', 'All ambulance units engaged in emergency transfers');
-    setSuccessMessage('Request declined.');
-    setTimeout(() => setSuccessMessage(null), 3000);
+  const handleRejectRequest = async (reqId: string) => {
+    try {
+      await respondToRequestInFirestore(reqId, 'rejected', 'All ambulance units engaged in emergency transfers');
+      setSuccessMessage('Request declined.');
+      setTimeout(() => setSuccessMessage(null), 3000);
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : 'Could not respond to the request.');
+    }
   };
 
   const tripStatuses: AmbulanceTripStatus[] = [
@@ -429,4 +441,3 @@ export const AmbulanceDashboard: React.FC = () => {
     </div>
   );
 };
-
