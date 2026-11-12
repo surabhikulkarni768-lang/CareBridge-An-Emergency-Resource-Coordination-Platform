@@ -273,10 +273,28 @@ export interface ResourceRequest {
     estimatedResponseTimeMinutes?: number;
   };
   status: RequestStatus;
+  assignedAt?: string;
+  assignmentCoordinatorUid?: string;
+  lastAssignmentAuditId?: string;
   rejectionReason?: string;
   respondedAt?: string;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface ResourceAssignmentAudit {
+  auditId: string;
+  requestId: string;
+  caseId: string;
+  resourceType: ResourceType;
+  previousProviderUid: string;
+  previousProviderName: string;
+  newProviderUid: string;
+  newProviderName: string;
+  coordinatorUid: string;
+  coordinatorName: string;
+  timestamp: string;
+  reason: string;
 }
 
 export type AmbulanceTripStatus =

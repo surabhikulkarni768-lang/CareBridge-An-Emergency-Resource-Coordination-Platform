@@ -134,6 +134,9 @@ const attendant = await createAccount('attendant', 'patientAttendant');
 const stranger = await createAccount('stranger', 'patient');
 const assignedProvider = await createAccount('assigned-provider', 'bloodBank');
 const unassignedProvider = await createAccount('unassigned-provider', 'bloodBank');
+const reassignedProvider = await createAccount('reassigned-provider', 'bloodBank');
+const inactiveProvider = await createAccount('inactive-provider', 'bloodBank');
+const unverifiedProvider = await createAccount('unverified-provider', 'bloodBank');
 const admin = await createAccount('admin', 'admin');
 const suspendedPatient = await createAccount('suspended-patient', 'patient');
 await seed(`users/${suspendedPatient.uid}`, {
@@ -158,6 +161,44 @@ await seed(`providerDirectory/${unassignedProvider.uid}`, {
   city: 'Hubballi',
   isActive: true,
   isVerified: true
+});
+await seed(`providerDirectory/${reassignedProvider.uid}`, {
+  uid: reassignedProvider.uid,
+  role: 'bloodBank',
+  displayName: 'Reassigned Blood Bank',
+  city: 'Hubballi',
+  isActive: true,
+  isVerified: true
+});
+await seed(`users/${inactiveProvider.uid}`, {
+  uid: inactiveProvider.uid,
+  email: 'inactive-provider@rules.test',
+  role: 'bloodBank',
+  isActive: false,
+  isVerified: true
+});
+await seed(`providerDirectory/${inactiveProvider.uid}`, {
+  uid: inactiveProvider.uid,
+  role: 'bloodBank',
+  displayName: 'Inactive Blood Bank',
+  city: 'Hubballi',
+  isActive: false,
+  isVerified: true
+});
+await seed(`users/${unverifiedProvider.uid}`, {
+  uid: unverifiedProvider.uid,
+  email: 'unverified-provider@rules.test',
+  role: 'bloodBank',
+  isActive: true,
+  isVerified: false
+});
+await seed(`providerDirectory/${unverifiedProvider.uid}`, {
+  uid: unverifiedProvider.uid,
+  role: 'bloodBank',
+  displayName: 'Unverified Blood Bank',
+  city: 'Hubballi',
+  isActive: true,
+  isVerified: false
 });
 const caseDocument = { ...patientCase, patientUid: patient.uid, requesterUid: patient.uid };
 const requestDocument = {
@@ -184,6 +225,48 @@ const updateWrite = (path, data) => ({
     fields: encodedFields(data)
   }
 });
+const assignmentWrites = ({ provider, reason, auditId }) => {
+  const requestPath = `projects/${projectId}/databases/(default)/documents/requests/${requestDocument.requestId}`;
+  const auditPath = `${requestPath}/assignmentHistory/${auditId}`;
+  return [
+    {
+      update: {
+        name: requestPath,
+        fields: encodedFields({
+          providerUid: provider.uid,
+          providerName: provider.name,
+          assignmentCoordinatorUid: admin.uid,
+          lastAssignmentAuditId: auditId
+        })
+      },
+      updateMask: {
+        fieldPaths: ['providerUid', 'providerName', 'assignmentCoordinatorUid', 'lastAssignmentAuditId']
+      },
+      updateTransforms: [
+        { fieldPath: 'assignedAt', setToServerValue: 'REQUEST_TIME' },
+        { fieldPath: 'updatedAt', setToServerValue: 'REQUEST_TIME' }
+      ]
+    },
+    {
+      update: {
+        name: auditPath,
+        fields: encodedFields({
+          requestId: requestDocument.requestId,
+          caseId,
+          resourceType: 'blood',
+          previousProviderUid: assignedProvider.uid,
+          previousProviderName: 'Rules Test Blood Bank',
+          newProviderUid: provider.uid,
+          newProviderName: provider.name,
+          coordinatorUid: admin.uid,
+          coordinatorName: 'Rules Test Admin',
+          reason
+        })
+      },
+      updateTransforms: [{ fieldPath: 'timestamp', setToServerValue: 'REQUEST_TIME' }]
+    }
+  ];
+};
 
 try {
   await check('Patient auth profile is present for authorization checks', async () => {
@@ -220,6 +303,86 @@ try {
     assert.equal(savedCase.data.fields.patientUid.stringValue, patient.uid);
     assert.equal(savedRequest.data.fields.caseId.stringValue, caseId);
     assert.equal(savedRequest.data.fields.requesterUid.stringValue, patient.uid);
+  });
+
+  await check('Patient and provider cannot assign resource requests', async () => {
+    const patientAttempt = await batchCommit(patient.token, assignmentWrites({
+      provider: { uid: reassignedProvider.uid, name: 'Reassigned Blood Bank' },
+      reason: 'Unauthorized patient assignment',
+      auditId: `${caseId}-patient-attempt`
+    }));
+    const providerAttempt = await batchCommit(assignedProvider.token, assignmentWrites({
+      provider: { uid: reassignedProvider.uid, name: 'Reassigned Blood Bank' },
+      reason: 'Unauthorized provider assignment',
+      auditId: `${caseId}-provider-attempt`
+    }));
+    assert.equal(patientAttempt.status, 403, JSON.stringify(patientAttempt.data));
+    assert.equal(providerAttempt.status, 403, JSON.stringify(providerAttempt.data));
+  });
+
+  await check('Only active and verified eligible providers can be assigned', async () => {
+    const inactiveAttempt = await batchCommit(admin.token, assignmentWrites({
+      provider: { uid: inactiveProvider.uid, name: 'Inactive Blood Bank' },
+      reason: 'Replace current provider',
+      auditId: `${caseId}-inactive-attempt`
+    }));
+    const unverifiedAttempt = await batchCommit(admin.token, assignmentWrites({
+      provider: { uid: unverifiedProvider.uid, name: 'Unverified Blood Bank' },
+      reason: 'Replace current provider',
+      auditId: `${caseId}-unverified-attempt`
+    }));
+    assert.equal(inactiveAttempt.status, 403, JSON.stringify(inactiveAttempt.data));
+    assert.equal(unverifiedAttempt.status, 403, JSON.stringify(unverifiedAttempt.data));
+  });
+
+  await check('Reassignment requires a reason and writes a linked immutable audit record', async () => {
+    const missingReason = await batchCommit(admin.token, assignmentWrites({
+      provider: { uid: reassignedProvider.uid, name: 'Reassigned Blood Bank' },
+      reason: '',
+      auditId: `${caseId}-missing-reason`
+    }));
+    assert.equal(missingReason.status, 403, JSON.stringify(missingReason.data));
+
+    const auditId = `${caseId}-audit-1`;
+    const reassignment = await batchCommit(admin.token, assignmentWrites({
+      provider: { uid: reassignedProvider.uid, name: 'Reassigned Blood Bank' },
+      reason: 'Original provider unavailable',
+      auditId
+    }));
+    expectSuccess(reassignment, 'Coordinator request reassignment');
+
+    const updatedRequest = await read(`requests/${requestDocument.requestId}`, admin.token);
+    const auditRecord = await read(`requests/${requestDocument.requestId}/assignmentHistory/${auditId}`, admin.token);
+    expectSuccess(updatedRequest, 'Reassigned request read');
+    expectSuccess(auditRecord, 'Assignment audit read');
+    assert.equal(updatedRequest.data.fields.providerUid.stringValue, reassignedProvider.uid);
+    assert.equal(updatedRequest.data.fields.status.stringValue, 'pending', 'Assignment must not change independent request status');
+    assert.equal(updatedRequest.data.fields.assignmentCoordinatorUid.stringValue, admin.uid);
+    assert.equal(auditRecord.data.fields.previousProviderUid.stringValue, assignedProvider.uid);
+    assert.equal(auditRecord.data.fields.newProviderUid.stringValue, reassignedProvider.uid);
+    assert.equal(auditRecord.data.fields.coordinatorUid.stringValue, admin.uid);
+    assert.equal(auditRecord.data.fields.reason.stringValue, 'Original provider unavailable');
+    assert.ok(auditRecord.data.fields.timestamp.timestampValue);
+  });
+
+  await check('Providers can read only currently assigned requests and cannot alter assignment history', async () => {
+    const previousProviderRead = await read(`requests/${requestDocument.requestId}`, assignedProvider.token);
+    const currentProviderRead = await read(`requests/${requestDocument.requestId}`, reassignedProvider.token);
+    assert.equal(previousProviderRead.status, 403, JSON.stringify(previousProviderRead.data));
+    expectSuccess(currentProviderRead, 'Current provider request read');
+
+    const tamperAudit = await request(`${documentsUrl}/requests/${requestDocument.requestId}/assignmentHistory/${caseId}-audit-1`, {
+      method: 'PATCH',
+      token: admin.token,
+      body: { fields: encodedFields({ reason: 'Altered historical reason' }) }
+    });
+    assert.equal(tamperAudit.status, 403, JSON.stringify(tamperAudit.data));
+
+    const deleteAudit = await request(`${documentsUrl}/requests/${requestDocument.requestId}/assignmentHistory/${caseId}-audit-1`, {
+      method: 'DELETE',
+      token: admin.token
+    });
+    assert.equal(deleteAudit.status, 403, JSON.stringify(deleteAudit.data));
   });
 
   await check('Suspended patient cannot create a case or atomic case/request batch', async () => {
@@ -325,17 +488,19 @@ try {
     assert.equal(malformedLink.status, 403, JSON.stringify(malformedLink.data));
   });
 
-  await check('Case reads remain restricted to the owner, active attendant, assigned provider, and admin', async () => {
+  await check('Case reads remain restricted to the owner, active attendant, current assigned provider, and admin', async () => {
     const ownerRead = await read(`cases/${caseId}`, patient.token);
     const attendantRead = await read(`cases/${caseId}`, attendant.token);
-    const assignedRead = await read(`cases/${caseId}`, assignedProvider.token);
+    const formerProviderRead = await read(`cases/${caseId}`, assignedProvider.token);
+    const currentProviderRead = await read(`cases/${caseId}`, reassignedProvider.token);
     const unassignedRead = await read(`cases/${caseId}`, unassignedProvider.token);
     const strangerRead = await read(`cases/${caseId}`, stranger.token);
     const adminRead = await read(`cases/${caseId}`, admin.token);
 
-    for (const [label, result] of [['owner', ownerRead], ['attendant', attendantRead], ['assigned provider', assignedRead], ['admin', adminRead]]) {
+    for (const [label, result] of [['owner', ownerRead], ['attendant', attendantRead], ['current assigned provider', currentProviderRead], ['admin', adminRead]]) {
       expectSuccess(result, `${label} case read`);
     }
+    assert.equal(formerProviderRead.status, 403, JSON.stringify(formerProviderRead.data));
     assert.equal(unassignedRead.status, 403, JSON.stringify(unassignedRead.data));
     assert.equal(strangerRead.status, 403, JSON.stringify(strangerRead.data));
   });
