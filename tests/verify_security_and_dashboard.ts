@@ -1062,7 +1062,7 @@ async function runTests() {
 
     if (targetCase && targetCase.serviceStatuses) {
       const getStat = (val: any): string => (typeof val === 'string' ? val : val?.status || '');
-      const independentTracking = 
+      const independentTracking =
         getStat(targetCase.serviceStatuses.hospital) === 'Submitted' &&
         getStat(targetCase.serviceStatuses.blood) === 'Not Requested' &&
         getStat(targetCase.serviceStatuses.oxygen) === 'Submitted' &&

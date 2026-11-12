@@ -18,7 +18,7 @@ import {
   FileText
 } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
-import { dataStore } from '../../services/dataService';
+import { dataStore, respondToRequestInFirestore, subscribeRequestsForProviderFromFirestore } from '../../services/dataService';
 import type { HospitalProfile, ResourceRequest, EmergencyCase } from '../../types';
 
 export const HospitalDashboard: React.FC = () => {
@@ -46,14 +46,18 @@ export const HospitalDashboard: React.FC = () => {
       setAvailICU(prof.availableICU);
       setAvailVentilators(prof.availableVentilators);
     }
-    setRequests(dataStore.getRequestsForProvider(currentUser.uid));
     setCases(dataStore.getCases());
   };
 
   useEffect(() => {
+    if (!currentUser) return;
     loadData();
-    const unsub = dataStore.subscribe(loadData);
-    return () => unsub();
+    const unsubscribeStore = dataStore.subscribe(loadData);
+    const unsubscribeRequests = subscribeRequestsForProviderFromFirestore(currentUser.uid, setRequests);
+    return () => {
+      unsubscribeStore();
+      unsubscribeRequests();
+    };
   }, [currentUser]);
 
   const handleUpdateAvailability = () => {
@@ -71,17 +75,25 @@ export const HospitalDashboard: React.FC = () => {
     }, 400);
   };
 
-  const handleAccept = (reqId: string) => {
-    dataStore.respondToRequest(reqId, 'accepted');
-    setSuccessMessage('Admission request accepted. Bed allocated & patient notified.');
-    setTimeout(() => setSuccessMessage(null), 3000);
+  const handleAccept = async (reqId: string) => {
+    try {
+      await respondToRequestInFirestore(reqId, 'accepted');
+      setSuccessMessage('Admission request accepted. Bed allocated & patient notified.');
+      setTimeout(() => setSuccessMessage(null), 3000);
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : 'Could not respond to the request.');
+    }
   };
 
-  const handleReject = (reqId: string) => {
-    dataStore.respondToRequest(reqId, 'rejected', rejectionReason);
-    setRejectingReqId(null);
-    setSuccessMessage('Admission request rejected. Reason logged & patient notified.');
-    setTimeout(() => setSuccessMessage(null), 3000);
+  const handleReject = async (reqId: string) => {
+    try {
+      await respondToRequestInFirestore(reqId, 'rejected', rejectionReason);
+      setRejectingReqId(null);
+      setSuccessMessage('Admission request rejected. Reason logged & patient notified.');
+      setTimeout(() => setSuccessMessage(null), 3000);
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : 'Could not respond to the request.');
+    }
   };
 
   const isActionRequired = (status: string) => status === 'pending' || status === 'ASSIGNED' || status === 'REQUESTED';
@@ -355,7 +367,7 @@ export const HospitalDashboard: React.FC = () => {
                           <p className="text-slate-600 italic">{linkedCase.conditionSummary}</p>
                           <div className="flex flex-wrap gap-x-4 gap-y-1 pt-1 text-[11px] text-slate-500">
                             <span>Age/Sex: {linkedCase.patientAge} / {linkedCase.patientGender}</span>
-                            <span>Location: {linkedCase.location.address}</span>
+                            <span>Location: {linkedCase.location?.address || linkedCase.incidentAddress || 'Not provided'}</span>
                             {linkedCase.attendant && (
                               <span>Attendant: {linkedCase.attendant.name} ({linkedCase.attendant.phone})</span>
                             )}
@@ -424,4 +436,3 @@ export const HospitalDashboard: React.FC = () => {
     </div>
   );
 };
-

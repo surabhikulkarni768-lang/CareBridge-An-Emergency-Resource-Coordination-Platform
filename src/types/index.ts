@@ -181,6 +181,13 @@ export interface EmergencyCase {
     relation: string;
     phone: string;
   };
+  attendantConsent?: {
+    granted: boolean;
+    givenByUid: string;
+    grantedAt: string;
+  };
+  submissionFingerprint?: string;
+  matchedHospitalName?: string;
   attendantName?: string;
   attendantRelation?: string;
   attendantPhone?: string;
@@ -209,7 +216,15 @@ export interface EmergencyCase {
   updatedAt?: string;
 }
 
-export type ResourceType = 'bed' | 'icu' | 'blood' | 'oxygen' | 'ambulance' | 'doctor' | 'hospital_admission' | 'doctor_assistance';
+export type ResourceType =
+  | 'bed'
+  | 'icu'
+  | 'blood'
+  | 'oxygen'
+  | 'ambulance'
+  | 'doctor'
+  | 'hospital_admission'
+  | 'doctor_assistance';
 export type RequestStatus =
   | 'Submitted'
   | 'Under Review'
@@ -236,6 +251,7 @@ export interface ResourceRequest {
   requestId: string; // REQ-YYYYMMDD-XXXX
   caseId: string;
   patientUid: string;
+  requesterUid?: string;
   patientName?: string;
   providerUid: string;
   providerName: string;
@@ -409,4 +425,3 @@ export interface ClinicalNote {
   };
   createdAt: string;
 }
-

@@ -12,7 +12,7 @@ import {
   Minus
 } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
-import { dataStore } from '../../services/dataService';
+import { dataStore, respondToRequestInFirestore, subscribeRequestsForProviderFromFirestore } from '../../services/dataService';
 import type { OxygenProfile, ResourceRequest } from '../../types';
 
 export const OxygenDashboard: React.FC = () => {
@@ -34,13 +34,17 @@ export const OxygenDashboard: React.FC = () => {
       setConcentrators(prof.concentratorsAvailable);
       setDeliveryAvailable(prof.deliveryAvailable);
     }
-    setRequests(dataStore.getRequestsForProvider(currentUser.uid));
   };
 
   useEffect(() => {
+    if (!currentUser) return;
     loadData();
-    const unsub = dataStore.subscribe(loadData);
-    return () => unsub();
+    const unsubscribeStore = dataStore.subscribe(loadData);
+    const unsubscribeRequests = subscribeRequestsForProviderFromFirestore(currentUser.uid, setRequests);
+    return () => {
+      unsubscribeStore();
+      unsubscribeRequests();
+    };
   }, [currentUser]);
 
   const handleSaveCapacity = () => {
@@ -58,16 +62,24 @@ export const OxygenDashboard: React.FC = () => {
     }, 400);
   };
 
-  const handleAccept = (reqId: string) => {
-    dataStore.respondToRequest(reqId, 'accepted');
-    setSuccessMessage('Oxygen request accepted. Cylinders allocated & patient notified.');
-    setTimeout(() => setSuccessMessage(null), 3000);
+  const handleAccept = async (reqId: string) => {
+    try {
+      await respondToRequestInFirestore(reqId, 'accepted');
+      setSuccessMessage('Oxygen request accepted. Cylinders allocated & patient notified.');
+      setTimeout(() => setSuccessMessage(null), 3000);
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : 'Could not respond to the request.');
+    }
   };
 
-  const handleReject = (reqId: string) => {
-    dataStore.respondToRequest(reqId, 'rejected', 'Zero cylinders currently pressurized');
-    setSuccessMessage('Oxygen request declined.');
-    setTimeout(() => setSuccessMessage(null), 3000);
+  const handleReject = async (reqId: string) => {
+    try {
+      await respondToRequestInFirestore(reqId, 'rejected', 'Zero cylinders currently pressurized');
+      setSuccessMessage('Oxygen request declined.');
+      setTimeout(() => setSuccessMessage(null), 3000);
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : 'Could not respond to the request.');
+    }
   };
 
   if (!profile) {
@@ -291,4 +303,3 @@ export const OxygenDashboard: React.FC = () => {
     </div>
   );
 };
-
