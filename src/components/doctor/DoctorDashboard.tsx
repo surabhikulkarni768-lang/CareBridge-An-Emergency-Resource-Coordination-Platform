@@ -13,14 +13,18 @@ import {
   RefreshCw
 } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
-import { dataStore } from '../../services/dataService';
-import type { EmergencyCase, ClinicalNote } from '../../types';
+import { dataStore, getAssignedCaseForProviderFromFirestore } from '../../services/dataService';
+import { ProviderRequestsPanel } from '../common/ProviderRequestsPanel';
+import type { EmergencyCase, ClinicalNote, ResourceRequest } from '../../types';
 
 export const DoctorDashboard: React.FC = () => {
   const { currentUser } = useAuth();
   const [cases, setCases] = useState<EmergencyCase[]>([]);
+  const [providerRequests, setProviderRequests] = useState<ResourceRequest[]>([]);
+  const [caseRefreshKey, setCaseRefreshKey] = useState(0);
   const [selectedCase, setSelectedCase] = useState<EmergencyCase | null>(null);
   const [clinicalNotes, setClinicalNotes] = useState<ClinicalNote[]>([]);
+  const [caseLoadError, setCaseLoadError] = useState<string | null>(null);
   const [newNoteText, setNewNoteText] = useState('');
   const [bp, setBp] = useState('140/90');
   const [pulse, setPulse] = useState('98 bpm');
@@ -28,22 +32,48 @@ export const DoctorDashboard: React.FC = () => {
   const [temp, setTemp] = useState('98.6 °F');
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
 
-  const loadData = () => {
-    const allCases = dataStore.getCases();
-    setCases(allCases);
-    if (!selectedCase && allCases.length > 0) {
-      setSelectedCase(allCases[0]);
+  useEffect(() => {
+    let isCurrent = true;
+    if (providerRequests.length === 0) {
+      setCases([]);
+      setSelectedCase(null);
+      setClinicalNotes([]);
+      setCaseLoadError(null);
+      return () => {
+        isCurrent = false;
+      };
     }
-    if (selectedCase) {
-      setClinicalNotes(dataStore.getClinicalNotes(selectedCase.caseId));
-    }
-  };
+
+    Promise.all(Array.from(new Set(providerRequests.map((request) => request.caseId)))
+      .map((caseId) => getAssignedCaseForProviderFromFirestore(caseId)))
+      .then((assignedCases) => {
+        if (!isCurrent) return;
+        const availableCases = assignedCases.filter((record): record is EmergencyCase => record !== null);
+        setCases(availableCases);
+        setSelectedCase((currentCase) =>
+          availableCases.find((record) => record.caseId === currentCase?.caseId) || availableCases[0] || null
+        );
+        setCaseLoadError(null);
+      })
+      .catch((error) => {
+        if (!isCurrent) return;
+        setCases([]);
+        setSelectedCase(null);
+        setCaseLoadError(error instanceof Error ? error.message : 'Assigned patient details could not be loaded.');
+      });
+
+    return () => {
+      isCurrent = false;
+    };
+  }, [providerRequests, currentUser?.uid, caseRefreshKey]);
 
   useEffect(() => {
-    loadData();
-    const unsub = dataStore.subscribe(loadData);
-    return () => unsub();
-  }, [currentUser, selectedCase?.caseId]);
+    const updateNotes = () => {
+      setClinicalNotes(selectedCase ? dataStore.getClinicalNotes(selectedCase.caseId) : []);
+    };
+    updateNotes();
+    return dataStore.subscribe(updateNotes);
+  }, [selectedCase?.caseId]);
 
   const handleAddNote = (e: React.FormEvent) => {
     e.preventDefault();
@@ -89,7 +119,7 @@ export const DoctorDashboard: React.FC = () => {
         </div>
 
         <button
-          onClick={loadData}
+          onClick={() => setCaseRefreshKey((key) => key + 1)}
           className="p-2.5 rounded-xl border border-slate-200 text-slate-600 hover:bg-slate-50 self-end sm:self-auto"
         >
           <RefreshCw className="w-4 h-4" />
@@ -103,6 +133,20 @@ export const DoctorDashboard: React.FC = () => {
         </div>
       )}
 
+      {currentUser && (
+        <ProviderRequestsPanel
+          providerUid={currentUser.uid}
+          title="Assigned Doctor Requests"
+          onRequestsChange={setProviderRequests}
+        />
+      )}
+
+      {caseLoadError && (
+        <div role="alert" className="rounded-xl border border-red-200 bg-red-50 p-3 text-xs text-red-800">
+          {caseLoadError}
+        </div>
+      )}
+
       {/* Main Grid: Cases List + Detail/Notes Panel */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Cases List */}
@@ -111,7 +155,11 @@ export const DoctorDashboard: React.FC = () => {
             Active Emergency Patients ({cases.length})
           </h2>
           <div className="space-y-2">
-            {cases.map((c) => (
+            {cases.length === 0 ? (
+              <p className="rounded-xl border border-slate-200 bg-white p-4 text-xs text-slate-500">
+                Patient details appear here only for your currently assigned requests.
+              </p>
+            ) : cases.map((c) => (
               <div
                 key={c.caseId}
                 onClick={() => setSelectedCase(c)}

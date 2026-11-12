@@ -17,6 +17,7 @@ import {
   setDoc,
   writeBatch,
   updateDoc,
+  deleteField,
   onSnapshot,
   query,
   where,
@@ -43,7 +44,9 @@ import type {
   PatientLink,
   CaseStatus,
   EmergencyServiceStatus,
-  ResourceAssignmentAudit
+  ResourceAssignmentAudit,
+  EmergencyLifecycleEvent,
+  EmergencyLifecycleStatus
 } from '../types';
 
 export interface ResourceRequestDraft {
@@ -80,6 +83,63 @@ const firestoreDateToIso = (value: unknown): string => {
   }
   throw new Error('A Firestore emergency record has an invalid timestamp.');
 };
+
+const normalizeLifecycleHistory = (
+  value: unknown
+): Record<string, EmergencyLifecycleEvent> | undefined => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  return Object.fromEntries(
+    Object.entries(value).map(([eventId, event]) => {
+      if (!event || typeof event !== 'object') {
+        throw new Error('A lifecycle history entry is invalid.');
+      }
+      const item = event as Record<string, unknown>;
+      return [eventId, {
+        ...item,
+        eventId: typeof item.eventId === 'string' ? item.eventId : eventId,
+        timestamp: firestoreDateToIso(item.timestamp)
+      } as EmergencyLifecycleEvent];
+    })
+  );
+};
+
+const normalizeEmergencyCase = (data: Record<string, unknown>, caseId: string): EmergencyCase => ({
+  ...data,
+  caseId: typeof data.caseId === 'string' ? data.caseId : caseId,
+  createdAt: firestoreDateToIso(data.createdAt),
+  updatedAt: data.updatedAt ? firestoreDateToIso(data.updatedAt) : undefined,
+  lifecycleHistory: normalizeLifecycleHistory(data.lifecycleHistory)
+} as EmergencyCase);
+
+const normalizeResourceRequest = (data: Record<string, unknown>, requestId: string): ResourceRequest => ({
+  ...data,
+  requestId: typeof data.requestId === 'string' ? data.requestId : requestId,
+  createdAt: firestoreDateToIso(data.createdAt),
+  updatedAt: data.updatedAt ? firestoreDateToIso(data.updatedAt) : '',
+  assignedAt: data.assignedAt ? firestoreDateToIso(data.assignedAt) : undefined,
+  respondedAt: data.respondedAt ? firestoreDateToIso(data.respondedAt) : undefined,
+  statusHistory: normalizeLifecycleHistory(data.statusHistory)
+} as ResourceRequest);
+
+const CASE_STATUS_TRANSITIONS: Record<string, EmergencyLifecycleStatus[]> = {
+  REQUESTED: ['UNDER_REVIEW', 'REJECTED', 'CANCELLED'],
+  Submitted: ['UNDER_REVIEW', 'REJECTED', 'CANCELLED'],
+  active: ['UNDER_REVIEW', 'REJECTED', 'CANCELLED'],
+  UNDER_REVIEW: ['ASSIGNED', 'REJECTED', 'CANCELLED'],
+  'Under Review': ['ASSIGNED', 'REJECTED', 'CANCELLED'],
+  ASSIGNED: ['UNDER_REVIEW', 'ACCEPTED', 'REJECTED', 'CANCELLED'],
+  ACCEPTED: ['RESOURCE_CONFIRMED', 'REJECTED', 'CANCELLED'],
+  RESOURCE_CONFIRMED: ['DISPATCHED', 'IN_PROGRESS', 'COMPLETED', 'CANCELLED'],
+  DISPATCHED: ['IN_PROGRESS', 'COMPLETED', 'CANCELLED'],
+  IN_PROGRESS: ['COMPLETED', 'CANCELLED']
+};
+
+const notificationDocumentId = (eventId: string, recipientUid: string): string =>
+  `${eventId}_${recipientUid}`;
+
+export function getAllowedEmergencyCaseTransitions(status: string): EmergencyLifecycleStatus[] {
+  return CASE_STATUS_TRANSITIONS[status] || [];
+}
 
 // ==========================================
 // SEEDED DEMO DATASET
@@ -857,15 +917,9 @@ class DataStore {
 
     const unsubscribeCases = onSnapshot(collection(db, 'cases'), (snapshot) => {
       try {
-        onCases(snapshot.docs.map((caseSnapshot) => {
-          const data = caseSnapshot.data();
-          return {
-            ...data,
-            caseId: data.caseId || caseSnapshot.id,
-            createdAt: firestoreDateToIso(data.createdAt),
-            updatedAt: firestoreDateToIso(data.updatedAt ?? data.createdAt)
-          } as EmergencyCase;
-        }));
+        onCases(snapshot.docs.map((caseSnapshot) =>
+          normalizeEmergencyCase(caseSnapshot.data(), caseSnapshot.id)
+        ));
       } catch (error) {
         onError(error instanceof Error ? error.message : 'Emergency cases could not be read.');
       }
@@ -875,15 +929,9 @@ class DataStore {
 
     const unsubscribeRequests = onSnapshot(collection(db, 'requests'), (snapshot) => {
       try {
-        onRequests(snapshot.docs.map((requestSnapshot) => {
-          const data = requestSnapshot.data();
-          return {
-            ...data,
-            requestId: data.requestId || requestSnapshot.id,
-            createdAt: firestoreDateToIso(data.createdAt),
-            updatedAt: data.updatedAt ? firestoreDateToIso(data.updatedAt) : ''
-          } as ResourceRequest;
-        }));
+        onRequests(snapshot.docs.map((requestSnapshot) =>
+          normalizeResourceRequest(requestSnapshot.data(), requestSnapshot.id)
+        ));
       } catch (error) {
         onError(error instanceof Error ? error.message : 'Resource requests could not be read.');
       }
@@ -1005,6 +1053,12 @@ class DataStore {
     const requestRef = doc(db, 'requests', requestId);
     const coordinatorRef = doc(db, 'users', coordinatorUid);
     const auditRef = doc(collection(db, 'requests', requestId, 'assignmentHistory'));
+    const notificationRef = doc(
+      db,
+      'notifications',
+      notificationDocumentId(auditRef.id, providerUid)
+    );
+    const statusEventId = doc(collection(db, 'requests', requestId, 'statusHistory')).id;
     const assignmentTimestamp = serverTimestamp();
     let assignedProviderName = '';
 
@@ -1077,6 +1131,10 @@ class DataStore {
 
       const coordinator = coordinatorSnapshot.data();
       assignedProviderName = provider.displayName || providerUser.displayName || '';
+      const previousStatus = String(requestData.status);
+      const statusHistory = requestData.statusHistory && typeof requestData.statusHistory === 'object'
+        ? requestData.statusHistory
+        : {};
       transaction.set(auditRef, {
         requestId,
         caseId: requestData.caseId,
@@ -1093,10 +1151,49 @@ class DataStore {
       transaction.update(requestRef, {
         providerUid,
         providerName: provider.displayName || providerUser.displayName || '',
+        status: 'ASSIGNED',
         assignedAt: assignmentTimestamp,
         assignmentCoordinatorUid: coordinatorUid,
         lastAssignmentAuditId: auditRef.id,
-        updatedAt: assignmentTimestamp
+        updatedAt: assignmentTimestamp,
+        respondedByUid: deleteField(),
+        respondedAt: deleteField(),
+        responseDetails: deleteField(),
+        rejectionReason: deleteField(),
+        ...(previousStatus !== 'ASSIGNED' ? {
+          lastStatusEventId: statusEventId,
+          statusHistory: {
+            ...statusHistory,
+            [statusEventId]: {
+              eventId: statusEventId,
+              eventType: 'request_status',
+              previousStatus,
+              newStatus: 'ASSIGNED',
+              updatedByUid: coordinatorUid,
+              userRole: 'admin',
+              timestamp: assignmentTimestamp,
+              requestId,
+              resourceType: requestData.resourceType
+            }
+          }
+        } : {})
+      });
+      transaction.set(notificationRef, {
+        recipientUid: providerUid,
+        type: 'request_assigned',
+        eventType: 'request_assignment',
+        eventId: auditRef.id,
+        title: previousProviderUid ? 'Resource request reassigned' : 'New resource request assigned',
+        message: `Emergency ${requestData.caseId}: ${requestData.resourceType} request assigned to you${previousProviderUid ? ` after reassignment: ${normalizedReason}` : '.'}`,
+        details: previousProviderUid ? normalizedReason : 'A coordinator assigned this emergency resource request to you.',
+        emergencyId: requestData.caseId,
+        relatedCaseId: requestData.caseId,
+        relatedRequestId: requestId,
+        resourceType: requestData.resourceType,
+        resourceDetails: requestData.details || {},
+        actorUid: coordinatorUid,
+        isRead: false,
+        createdAt: assignmentTimestamp
       });
     });
 
@@ -1104,10 +1201,164 @@ class DataStore {
     if (localRequest) {
       localRequest.providerUid = providerUid;
       localRequest.providerName = assignedProviderName;
+      localRequest.status = 'ASSIGNED';
       localRequest.assignedAt = new Date().toISOString();
       localRequest.assignmentCoordinatorUid = coordinatorUid;
       this.saveState();
     }
+  }
+
+  public async transitionEmergencyCaseStatus(
+    caseId: string,
+    nextStatus: EmergencyLifecycleStatus,
+    reason?: string
+  ): Promise<void> {
+    if (!isFirebaseConfigured || !db || !auth.currentUser) {
+      throw new Error('Emergency lifecycle updates require an authenticated coordinator account.');
+    }
+
+    const coordinatorUid = auth.currentUser.uid;
+    const normalizedReason = reason?.trim() || '';
+    if ((nextStatus === 'REJECTED' || nextStatus === 'CANCELLED') && normalizedReason.length < 5) {
+      throw new Error('A reason of at least five characters is required for rejection or cancellation.');
+    }
+
+    const caseRef = doc(db, 'cases', caseId);
+    const coordinatorRef = doc(db, 'users', coordinatorUid);
+    const caseEventId = doc(collection(db, 'cases', caseId, 'statusHistory')).id;
+    const transitionTimestamp = serverTimestamp();
+    const requestDocuments = nextStatus === 'REJECTED' || nextStatus === 'CANCELLED'
+      ? (await getDocs(query(collection(db, 'requests'), where('caseId', '==', caseId)))).docs
+      : [];
+
+    await runTransaction(db, async (transaction) => {
+      const [caseSnapshot, coordinatorSnapshot] = await Promise.all([
+        transaction.get(caseRef),
+        transaction.get(coordinatorRef)
+      ]);
+      const requestSnapshots = await Promise.all(
+        requestDocuments.map((requestDocument) => transaction.get(requestDocument.ref))
+      );
+      if (!caseSnapshot.exists()) {
+        throw new Error('This emergency case no longer exists. Refresh and try again.');
+      }
+      const coordinator = coordinatorSnapshot.data();
+      if (!coordinatorSnapshot.exists() || coordinator?.role !== 'admin' || coordinator?.isActive !== true) {
+        throw new Error('Only an active, authenticated coordinator can update the emergency lifecycle.');
+      }
+
+      const emergencyCase = caseSnapshot.data();
+      const patientUid = emergencyCase.patientUid;
+      if (typeof patientUid !== 'string' || !patientUid) {
+        throw new Error('This emergency case has no valid patient account.');
+      }
+      const previousStatus = String(emergencyCase.status || '');
+      if (!getAllowedEmergencyCaseTransitions(previousStatus).includes(nextStatus)) {
+        throw new Error(`The emergency cannot transition from ${previousStatus || 'unknown'} to ${nextStatus}.`);
+      }
+
+      const caseEvent = {
+        eventId: caseEventId,
+        eventType: 'case_status',
+        previousStatus,
+        newStatus: nextStatus,
+        updatedByUid: coordinatorUid,
+        userRole: coordinator.role,
+        timestamp: transitionTimestamp,
+        ...(normalizedReason ? { reason: normalizedReason } : {})
+      };
+      transaction.update(caseRef, {
+        status: nextStatus,
+        updatedAt: transitionTimestamp,
+        lastLifecycleEventId: caseEventId,
+        [`lifecycleHistory.${caseEventId}`]: caseEvent,
+        rejectionReason: nextStatus === 'REJECTED' ? normalizedReason : deleteField(),
+        cancellationReason: nextStatus === 'CANCELLED' ? normalizedReason : deleteField()
+      });
+      requestSnapshots.forEach((requestSnapshot) => {
+        if (!requestSnapshot.exists()) return;
+        const request = requestSnapshot.data();
+        const requestStatus = String(request.status || '');
+        if (['COMPLETED', 'REJECTED', 'CANCELLED', 'completed', 'rejected', 'cancelled'].includes(requestStatus)) return;
+        const requestEventId = doc(collection(db, 'requests', requestSnapshot.id, 'statusHistory')).id;
+        const requestEvent = {
+          eventId: requestEventId,
+          eventType: 'request_status',
+          previousStatus: requestStatus,
+          newStatus: nextStatus,
+          updatedByUid: coordinatorUid,
+          userRole: coordinator.role,
+          timestamp: transitionTimestamp,
+          reason: normalizedReason,
+          requestId: requestSnapshot.id,
+          resourceType: request.resourceType
+        };
+        transaction.update(requestSnapshot.ref, {
+          status: nextStatus,
+          updatedAt: transitionTimestamp,
+          lastStatusEventId: requestEventId,
+          [`statusHistory.${requestEventId}`]: requestEvent,
+          rejectionReason: nextStatus === 'REJECTED' ? normalizedReason : deleteField(),
+          cancellationReason: nextStatus === 'CANCELLED' ? normalizedReason : deleteField()
+        });
+      });
+    });
+  }
+
+  public async getEmergencyTimelineFromFirestore(caseId: string): Promise<EmergencyLifecycleEvent[]> {
+    if (!isFirebaseConfigured || !db || !auth.currentUser) {
+      throw new Error('Emergency timeline requires an authenticated coordinator account.');
+    }
+    const caseSnapshot = await getDoc(doc(db, 'cases', caseId));
+    if (!caseSnapshot.exists()) throw new Error('This emergency case no longer exists.');
+    const caseData = caseSnapshot.data();
+    const events = Object.values(normalizeLifecycleHistory(caseData.lifecycleHistory) || {});
+    (Array.isArray(caseData.auditHistory) ? caseData.auditHistory : []).forEach((legacyAudit) => {
+      if (!legacyAudit || typeof legacyAudit !== 'object') return;
+      const audit = legacyAudit as Record<string, unknown>;
+      if (typeof audit.timestamp !== 'string') return;
+      events.push({
+        eventId: String(audit.id || `legacy-${audit.timestamp}`),
+        eventType: 'case_status',
+        previousStatus: 'Unknown',
+        newStatus: String(audit.status || 'Status updated'),
+        updatedByUid: String(audit.updatedByUid || ''),
+        userRole: String(audit.role || 'unknown'),
+        timestamp: audit.timestamp,
+        ...(typeof audit.reason === 'string' ? { reason: audit.reason } : {})
+      });
+    });
+    const requestSnapshot = await getDocs(
+      query(collection(db, 'requests'), where('caseId', '==', caseId))
+    );
+
+    for (const requestDocument of requestSnapshot.docs) {
+      const request = requestDocument.data();
+      events.push(...Object.values(normalizeLifecycleHistory(request.statusHistory) || {}));
+      const assignmentSnapshot = await getDocs(
+        collection(db, 'requests', requestDocument.id, 'assignmentHistory')
+      );
+      assignmentSnapshot.docs.forEach((auditDocument) => {
+        const audit = auditDocument.data();
+        events.push({
+          eventId: auditDocument.id,
+          eventType: 'assignment',
+          previousStatus: String(request.status || 'REQUESTED'),
+          newStatus: String(request.status || 'REQUESTED'),
+          updatedByUid: audit.coordinatorUid || '',
+          userRole: 'admin',
+          timestamp: firestoreDateToIso(audit.timestamp),
+          reason: audit.reason,
+          requestId: requestDocument.id,
+          resourceType: request.resourceType,
+          previousProviderUid: audit.previousProviderUid || '',
+          newProviderUid: audit.newProviderUid || '',
+          previousProviderName: audit.previousProviderName || '',
+          newProviderName: audit.newProviderName || ''
+        });
+      });
+    }
+    return events.sort((left, right) => Date.parse(left.timestamp) - Date.parse(right.timestamp));
   }
 
   public subscribeToEmergencyHistory(
@@ -1121,15 +1372,26 @@ class DataStore {
     }
 
     const casesByPatient = new Map<string, Map<string, EmergencyCase>>();
+    const requestsByPatient = new Map<string, Map<string, ResourceRequest[]>>();
     const caseSubscriptions = new Map<string, Unsubscribe>();
-    const loadedPatientUids = new Set<string>();
+    const requestSubscriptions = new Map<string, Unsubscribe>();
+    const loadedCasePatients = new Set<string>();
+    const loadedRequestPatients = new Set<string>();
     let activeLinksLoaded = false;
     const emitCases = () => {
-      if (!activeLinksLoaded || [...caseSubscriptions.keys()].some((uid) => !loadedPatientUids.has(uid))) return;
+      if (!activeLinksLoaded || [...caseSubscriptions.keys()].some((uid) =>
+        !loadedCasePatients.has(uid) || !loadedRequestPatients.has(uid)
+      )) return;
       const cases = [...casesByPatient.values()]
         .flatMap((patientCases) => [...patientCases.values()])
         .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
       onCases(cases);
+    };
+    const applyRequestsToCases = (linkedPatientUid: string) => {
+      const requestGroups = requestsByPatient.get(linkedPatientUid) || new Map<string, ResourceRequest[]>();
+      casesByPatient.get(linkedPatientUid)?.forEach((caseRecord) => {
+        caseRecord.resourceRequests = requestGroups.get(caseRecord.caseId) || [];
+      });
     };
     const subscribeToPatientCases = (linkedPatientUid: string) => {
       if (caseSubscriptions.has(linkedPatientUid)) return;
@@ -1140,16 +1402,11 @@ class DataStore {
         try {
           patientCases.clear();
           snapshot.docs.forEach((caseSnapshot) => {
-            const data = caseSnapshot.data();
-            const caseRecord = {
-              ...data,
-              caseId: data.caseId || caseSnapshot.id,
-              createdAt: firestoreDateToIso(data.createdAt),
-              updatedAt: firestoreDateToIso(data.updatedAt)
-            } as EmergencyCase;
+            const caseRecord = normalizeEmergencyCase(caseSnapshot.data(), caseSnapshot.id);
             patientCases.set(caseRecord.caseId, caseRecord);
           });
-          loadedPatientUids.add(linkedPatientUid);
+          applyRequestsToCases(linkedPatientUid);
+          loadedCasePatients.add(linkedPatientUid);
           emitCases();
         } catch (error) {
           onError(error instanceof Error ? error.message : 'An emergency record could not be read.');
@@ -1158,6 +1415,29 @@ class DataStore {
         onError(`Could not load emergency history: ${error.message}`);
       });
       caseSubscriptions.set(linkedPatientUid, unsubscribe);
+
+      const patientRequests = new Map<string, ResourceRequest[]>();
+      requestsByPatient.set(linkedPatientUid, patientRequests);
+      const requestsQuery = query(collection(db, 'requests'), where('patientUid', '==', linkedPatientUid));
+      const unsubscribeRequests = onSnapshot(requestsQuery, (snapshot) => {
+        try {
+          patientRequests.clear();
+          snapshot.docs.forEach((requestSnapshot) => {
+            const requestRecord = normalizeResourceRequest(requestSnapshot.data(), requestSnapshot.id);
+            const caseRequests = patientRequests.get(requestRecord.caseId) || [];
+            caseRequests.push(requestRecord);
+            patientRequests.set(requestRecord.caseId, caseRequests);
+          });
+          applyRequestsToCases(linkedPatientUid);
+          loadedRequestPatients.add(linkedPatientUid);
+          emitCases();
+        } catch (error) {
+          onError(error instanceof Error ? error.message : 'A resource request status could not be read.');
+        }
+      }, (error) => {
+        onError(`Could not load emergency resource statuses: ${error.message}`);
+      });
+      requestSubscriptions.set(linkedPatientUid, unsubscribeRequests);
     };
 
     subscribeToPatientCases(patientUid);
@@ -1179,9 +1459,13 @@ class DataStore {
       caseSubscriptions.forEach((unsubscribe, linkedPatientUid) => {
         if (linkedPatientUid !== patientUid && !linkedPatientUids.has(linkedPatientUid)) {
           unsubscribe();
+          requestSubscriptions.get(linkedPatientUid)?.();
+          requestSubscriptions.delete(linkedPatientUid);
           caseSubscriptions.delete(linkedPatientUid);
           casesByPatient.delete(linkedPatientUid);
-          loadedPatientUids.delete(linkedPatientUid);
+          requestsByPatient.delete(linkedPatientUid);
+          loadedCasePatients.delete(linkedPatientUid);
+          loadedRequestPatients.delete(linkedPatientUid);
         }
       });
       linkedPatientUids.forEach(subscribeToPatientCases);
@@ -1193,8 +1477,11 @@ class DataStore {
     return () => {
       unsubscribeLinks();
       caseSubscriptions.forEach((unsubscribe) => unsubscribe());
+      requestSubscriptions.forEach((unsubscribe) => unsubscribe());
       caseSubscriptions.clear();
+      requestSubscriptions.clear();
       casesByPatient.clear();
+      requestsByPatient.clear();
     };
   }
 
@@ -1344,7 +1631,7 @@ class DataStore {
           requestData.resourceType !== draft.resourceType ||
           typeof requestData.providerUid !== 'string' ||
           typeof requestData.providerName !== 'string' ||
-          !['pending', 'accepted', 'rejected', 'cancelled', 'completed'].includes(requestData.status) ||
+          !['pending', 'REQUESTED', 'ASSIGNED', 'accepted', 'ACCEPTED', 'rejected', 'REJECTED', 'cancelled', 'CANCELLED', 'completed', 'COMPLETED'].includes(requestData.status) ||
           !detailsMatch
         ) {
           throw new Error('Saved request details do not match this case. Please contact support.');
@@ -1425,7 +1712,7 @@ class DataStore {
           details: draft.resourceType === 'ambulance'
             ? { ...draft.details, destinationAddress: hospitalProvider.displayName }
             : draft.details,
-          status: 'pending' as const,
+          status: 'REQUESTED' as const,
           createdAt: now,
           updatedAt: now
         }
@@ -1435,6 +1722,7 @@ class DataStore {
     const batch = writeBatch(db);
     batch.set(caseRef, {
       ...emergencyCase,
+      status: 'REQUESTED',
       requesterUid,
       requesterRole: requester.role,
       attendantUid: isSelfSubmission ? emergencyCase.attendantUid : requesterUid,
@@ -1453,6 +1741,7 @@ class DataStore {
 
     const savedCase = {
       ...emergencyCase,
+      status: 'REQUESTED' as const,
       requesterUid,
       requesterRole: requester.role,
       attendantUid: isSelfSubmission ? emergencyCase.attendantUid : requesterUid,
@@ -2190,13 +2479,13 @@ export async function createEmergencyCase(
     return { success: true, caseId: caseRecord.caseId };
   }
 
-  // 3. Save to local data store
-  dataStore.createCase(caseRecord);
+  const submittedCase = { ...caseRecord, status: 'REQUESTED' as const };
+  dataStore.createCase(submittedCase);
 
   // 4. Save to Firestore if configured
   if (isFirebaseConfigured && db) {
     try {
-      await setDoc(doc(db, 'cases', caseRecord.caseId), caseRecord);
+      await setDoc(doc(db, 'cases', caseRecord.caseId), submittedCase);
     } catch (err: any) {
       console.warn('[CareBridge Firestore] Failed to write case to Firestore:', err);
       throw err;
@@ -2207,10 +2496,11 @@ export async function createEmergencyCase(
 }
 
 export async function saveCaseToFirestore(emergencyCase: EmergencyCase): Promise<void> {
-  dataStore.createCase(emergencyCase);
+  const submittedCase = { ...emergencyCase, status: 'REQUESTED' as const };
+  dataStore.createCase(submittedCase);
   if (isFirebaseConfigured && db) {
     try {
-      await setDoc(doc(db, 'cases', emergencyCase.caseId), emergencyCase);
+      await setDoc(doc(db, 'cases', emergencyCase.caseId), submittedCase);
     } catch (err) {
       console.warn('[CareBridge Firestore] Failed to write case to Firestore:', err);
     }
@@ -2238,13 +2528,12 @@ export async function fetchRequestsForCasesFromFirestore(caseIds: string[]): Pro
 
 export function subscribeRequestsForProviderFromFirestore(
   providerUid: string,
-  onUpdate: (requests: ResourceRequest[]) => void
+  onUpdate: (requests: ResourceRequest[]) => void,
+  onError: (message: string) => void
 ): Unsubscribe {
-  if (!isFirebaseConfigured || !db) {
-    onUpdate(dataStore.getRequestsForProvider(providerUid));
-    return dataStore.subscribe(() => {
-      onUpdate(dataStore.getRequestsForProvider(providerUid));
-    });
+  if (!isFirebaseConfigured || !db || !auth.currentUser || auth.currentUser.uid !== providerUid) {
+    onError('Sign in with the assigned provider account to load resource requests from Firestore.');
+    return () => undefined;
   }
 
   try {
@@ -2253,61 +2542,216 @@ export function subscribeRequestsForProviderFromFirestore(
       (snapshot) => {
         try {
           const requests = snapshot.docs.map((requestSnapshot) => {
-            const data = requestSnapshot.data();
-            const createdAt = firestoreDateToIso(data.createdAt);
-            return {
-              ...data,
-              requestId: data.requestId || requestSnapshot.id,
-              createdAt,
-              updatedAt: data.updatedAt ? firestoreDateToIso(data.updatedAt) : createdAt,
-              respondedAt: data.respondedAt ? firestoreDateToIso(data.respondedAt) : undefined
-            } as ResourceRequest;
+            return normalizeResourceRequest(requestSnapshot.data(), requestSnapshot.id);
           });
           requests.sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
-          dataStore.replaceRequestsForProvider(providerUid, requests);
           onUpdate(requests);
         } catch (error) {
-          console.warn('[CareBridge Firestore] Could not parse provider requests:', error);
-          dataStore.replaceRequestsForProvider(providerUid, []);
-          onUpdate([]);
+          onError(error instanceof Error ? error.message : 'Assigned resource requests contain invalid data.');
         }
       },
       (error) => {
-        console.warn('[CareBridge Firestore] Could not load provider requests:', error);
-        dataStore.replaceRequestsForProvider(providerUid, []);
-        onUpdate([]);
+        onError(`Could not load assigned resource requests: ${error.message}`);
       }
     );
   } catch (error) {
-    console.warn('[CareBridge Firestore] Could not subscribe to provider requests:', error);
-    onUpdate([]);
+    onError(error instanceof Error ? error.message : 'Could not subscribe to assigned resource requests.');
     return () => undefined;
   }
 }
 
+export async function getAssignedCaseForProviderFromFirestore(caseId: string): Promise<EmergencyCase | null> {
+  if (!isFirebaseConfigured || !db || !auth.currentUser) {
+    throw new Error('Assigned patient details require an authenticated Firebase provider account.');
+  }
+  const caseSnapshot = await getDoc(doc(db, 'cases', caseId));
+  if (!caseSnapshot.exists()) return null;
+  return normalizeEmergencyCase(caseSnapshot.data(), caseSnapshot.id);
+}
+
 export async function respondToRequestInFirestore(
   requestId: string,
-  status: 'accepted' | 'rejected' | 'completed',
+  status: 'accepted' | 'rejected',
   reason?: string
-): Promise<void> {
-  const request = dataStore.getRequests().find((item) => item.requestId === requestId);
-  if (!request) {
-    throw new Error('This resource request is no longer available.');
+): Promise<boolean> {
+  if (!isFirebaseConfigured || !db || !auth.currentUser) {
+    throw new Error('Provider responses require an authenticated Firebase account.');
+  }
+  const providerUid = auth.currentUser.uid;
+  const normalizedReason = reason?.trim() || '';
+  if (status === 'rejected' && normalizedReason.length < 5) {
+    throw new Error('A rejection reason of at least five characters is required.');
   }
 
-  if (isFirebaseConfigured && db) {
-    if (auth.currentUser?.uid !== request.providerUid) {
-      throw new Error('Only the assigned provider can respond to this request.');
+  const requestRef = doc(db, 'requests', requestId);
+  const statusEventId = doc(collection(db, 'requests', requestId, 'statusHistory')).id;
+  const providerRef = doc(db, 'users', providerUid);
+  const providerDirectoryRef = doc(db, 'providerDirectory', providerUid);
+  const responseTimestamp = serverTimestamp();
+
+  return runTransaction(db, async (transaction) => {
+    const [requestSnapshot, providerSnapshot, directorySnapshot] = await Promise.all([
+      transaction.get(requestRef),
+      transaction.get(providerRef),
+      transaction.get(providerDirectoryRef)
+    ]);
+    if (!requestSnapshot.exists()) {
+      throw new Error('This resource request is no longer available.');
     }
 
-    const respondedAt = new Date().toISOString();
-    await updateDoc(doc(db, 'requests', requestId), {
-      status,
-      respondedAt,
-      updatedAt: respondedAt,
-      ...(reason ? { rejectionReason: reason } : {})
+    const request = requestSnapshot.data();
+    const provider = providerSnapshot.data();
+    const directory = directorySnapshot.data();
+    if (request.providerUid !== providerUid) {
+      throw new Error('Only the currently assigned provider can respond to this request.');
+    }
+    if (!providerSnapshot.exists() || !directorySnapshot.exists() ||
+      provider?.isActive !== true || provider?.isVerified !== true ||
+      directory?.isActive !== true || directory?.isVerified !== true ||
+      directory?.uid !== providerUid || directory?.role !== provider?.role) {
+      throw new Error('Only active, verified providers can respond to assigned requests.');
+    }
+    const roleByResource: Record<ResourceRequest['resourceType'], UserRole> = {
+      bed: 'hospital',
+      icu: 'hospital',
+      hospital_admission: 'hospital',
+      blood: 'bloodBank',
+      oxygen: 'oxygenProvider',
+      ambulance: 'ambulanceProvider',
+      doctor: 'doctor',
+      doctor_assistance: 'doctor'
+    };
+    if (roleByResource[request.resourceType as ResourceRequest['resourceType']] !== provider.role) {
+      throw new Error('This provider is not eligible to respond to the resource type.');
+    }
+    if (!['pending', 'assigned', 'requested', 'ASSIGNED', 'REQUESTED'].includes(String(request.status))) {
+      throw new Error('This request has already received a response or is no longer actionable.');
+    }
+
+    const previousStatus = String(request.status);
+    const nextStatus: EmergencyLifecycleStatus = status === 'accepted' ? 'ACCEPTED' : 'REJECTED';
+    const responseDetails = status === 'accepted' ? 'Accepted by provider.' : normalizedReason;
+    const statusEvent = {
+      eventId: statusEventId,
+      eventType: 'request_status',
+      previousStatus,
+      newStatus: nextStatus,
+      updatedByUid: providerUid,
+      userRole: provider.role,
+      timestamp: responseTimestamp,
+      ...(status === 'rejected' ? { reason: normalizedReason } : {}),
+      requestId,
+      resourceType: request.resourceType
+    };
+    const coordinatorUid = typeof request.assignmentCoordinatorUid === 'string'
+      ? request.assignmentCoordinatorUid
+      : '';
+    if (!coordinatorUid) {
+      throw new Error('This assigned request has no coordinator to notify.');
+    }
+    const notificationRef = doc(
+      db,
+      'notifications',
+      notificationDocumentId(statusEventId, coordinatorUid)
+    );
+    const providerName = directory.displayName || provider.displayName || providerUid;
+    transaction.update(requestRef, {
+      status: nextStatus,
+      respondedByUid: providerUid,
+      responseDetails,
+      ...(status === 'rejected' ? { rejectionReason: normalizedReason } : {}),
+      respondedAt: responseTimestamp,
+      updatedAt: responseTimestamp,
+      lastStatusEventId: statusEventId,
+      [`statusHistory.${statusEventId}`]: statusEvent
     });
+    transaction.set(notificationRef, {
+      recipientUid: coordinatorUid,
+      type: status === 'accepted' ? 'request_accepted' : 'request_rejected',
+      eventType: 'provider_response',
+      eventId: statusEventId,
+      title: `Resource request ${status}`,
+      message: status === 'accepted'
+        ? `Emergency ${request.caseId}: ${providerName} accepted the ${request.resourceType} request.`
+        : `Emergency ${request.caseId}: ${providerName} rejected the ${request.resourceType} request: ${normalizedReason}`,
+      details: responseDetails,
+      emergencyId: request.caseId,
+      relatedCaseId: request.caseId,
+      relatedRequestId: requestId,
+      resourceType: request.resourceType,
+      resourceDetails: request.details || {},
+      actorUid: providerUid,
+      responseProviderUid: providerUid,
+      isRead: false,
+      createdAt: responseTimestamp
+    });
+    return true;
+  });
+}
+
+export function subscribeNotificationsForUserFromFirestore(
+  recipientUid: string,
+  onUpdate: (notifications: NotificationItem[]) => void,
+  onError: (message: string) => void
+): Unsubscribe {
+  if (!isFirebaseConfigured || !db) {
+    onUpdate(dataStore.getNotifications(recipientUid));
+    return dataStore.subscribe(() => onUpdate(dataStore.getNotifications(recipientUid)));
+  }
+  if (!auth.currentUser || auth.currentUser.uid !== recipientUid) {
+    onError('Sign in to load notifications for this account.');
+    return () => undefined;
   }
 
-  dataStore.respondToRequest(requestId, status, reason);
+  return onSnapshot(
+    query(collection(db, 'notifications'), where('recipientUid', '==', recipientUid)),
+    (snapshot) => {
+      try {
+        const notifications = snapshot.docs.map((notificationSnapshot) => {
+          const data = notificationSnapshot.data();
+          return {
+            ...data,
+            id: notificationSnapshot.id,
+            createdAt: firestoreDateToIso(data.createdAt)
+          } as NotificationItem;
+        });
+        notifications.sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+        onUpdate(notifications);
+      } catch (error) {
+        onError(error instanceof Error ? error.message : 'Notification data is invalid.');
+      }
+    },
+    (error) => onError(`Could not load notifications: ${error.message}`)
+  );
+}
+
+export async function markNotificationReadInFirestore(notificationId: string): Promise<void> {
+  if (!isFirebaseConfigured || !db) {
+    dataStore.markNotificationAsRead(notificationId);
+    return;
+  }
+  if (!auth.currentUser) throw new Error('Sign in to update notifications.');
+  await updateDoc(doc(db, 'notifications', notificationId), { isRead: true });
+}
+
+export async function markAllNotificationsReadInFirestore(recipientUid: string): Promise<void> {
+  if (!isFirebaseConfigured || !db) {
+    dataStore.markAllNotificationsAsRead(recipientUid);
+    return;
+  }
+  if (!auth.currentUser || auth.currentUser.uid !== recipientUid) {
+    throw new Error('Sign in to update notifications for this account.');
+  }
+  const unread = await getDocs(query(
+    collection(db, 'notifications'),
+    where('recipientUid', '==', recipientUid),
+    where('isRead', '==', false)
+  ));
+  for (let offset = 0; offset < unread.docs.length; offset += 500) {
+    const batch = writeBatch(db);
+    unread.docs.slice(offset, offset + 500).forEach((notificationSnapshot) => {
+      batch.update(notificationSnapshot.ref, { isRead: true });
+    });
+    await batch.commit();
+  }
 }

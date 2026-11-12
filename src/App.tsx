@@ -477,7 +477,6 @@ function CareBridgeApp() {
   const [isSubmittingEmergency, setIsSubmittingEmergency] = useState(false);
   const [isLocating, setIsLocating] = useState(false);
   const [locationPermissionStatus, setLocationPermissionStatus] = useState<'idle' | 'prompted' | 'granted' | 'denied'>('idle');
-  const [cancelConfirmCaseId, setCancelConfirmCaseId] = useState<string | null>(null);
 
   // Linked Patients State for Attendants
   const [linkedPatients, setLinkedPatients] = useState<PatientLink[]>([]);
@@ -1353,19 +1352,6 @@ function CareBridgeApp() {
     setCurrentScreen('selection');
   };
 
-  const handleMarkCaseCompleted = (caseId: string) => {
-    setCasesList((prev) => {
-      const updated = prev.map((c) => (c.caseId === caseId ? { ...c, status: 'Completed' as const } : c));
-      try {
-        localStorage.setItem('carebridge_cases_list', JSON.stringify(updated));
-      } catch (e) {}
-      return updated;
-    });
-    if (selectedDashboardCase?.caseId === caseId) {
-      setSelectedDashboardCase((prev) => (prev ? { ...prev, status: 'Completed' } : null));
-    }
-  };
-
   const handleAttendantConsent = async (attendantUid: string, activeConsent: boolean) => {
     if (!currentUser || currentUser.role !== 'patient') return;
     setSavingAttendantUid(attendantUid);
@@ -1417,7 +1403,14 @@ function CareBridgeApp() {
       providerDetails: 'Emergency case record',
       providerRating: 'Verified provider',
       resourcesList: (record.resourcesNeeded || []).map((resource) => resourceNames[resource] || resource),
-      individualStatuses: []
+      individualStatuses: (record.resourceRequests || []).map((request) => ({
+        resource: request.resourceType,
+        detail: request.details.notes || request.details.urgency || '',
+        status: String(request.status).replaceAll('_', ' '),
+        code: ['COMPLETED', 'completed'].includes(String(request.status)) ? 'completed' :
+          ['ACCEPTED', 'accepted'].includes(String(request.status)) ? 'reserved' : 'pending',
+        updatedAt: request.updatedAt || ''
+      }))
     });
     setSelectedCaseFromHistory(true);
   };
@@ -4311,6 +4304,29 @@ function CareBridgeApp() {
                               <p className="text-xs text-slate-600">
                                 Status: <span className="font-semibold capitalize">{record.status}</span>
                               </p>
+                              {(record.resourceRequests || []).length > 0 && (
+                                <div className="pt-1 space-y-1">
+                                  <p className="text-[11px] font-bold uppercase tracking-wide text-slate-500">Resource request statuses</p>
+                                  {record.resourceRequests?.map((request) => (
+                                    <p key={request.requestId} className="text-xs text-slate-600">
+                                      <span className="font-semibold capitalize">{request.resourceType.replaceAll('_', ' ')}</span>: {String(request.status).replaceAll('_', ' ')}
+                                    </p>
+                                  ))}
+                                </div>
+                              )}
+                              {Object.values(record.lifecycleHistory || {}).length > 0 && (
+                                <div className="pt-1 space-y-1">
+                                  <p className="text-[11px] font-bold uppercase tracking-wide text-slate-500">Recent status updates</p>
+                                  {[...Object.values(record.lifecycleHistory || {})]
+                                    .sort((left, right) => Date.parse(right.timestamp) - Date.parse(left.timestamp))
+                                    .slice(0, 3)
+                                    .map((event) => (
+                                      <p key={event.eventId} className="text-xs text-slate-600">
+                                        {event.previousStatus.replaceAll('_', ' ')} → {event.newStatus.replaceAll('_', ' ')} · {new Date(event.timestamp).toLocaleString()}
+                                      </p>
+                                    ))}
+                                </div>
+                              )}
                             </div>
                             <button
                               type="button"
@@ -4501,19 +4517,6 @@ function CareBridgeApp() {
 
                   {/* Action Buttons */}
                   <div className="space-y-2 pt-2 border-t border-slate-100">
-                    {!selectedCaseFromHistory &&
-                      selectedDashboardCase.status !== 'Completed' &&
-                      selectedDashboardCase.status !== 'Cancelled' && (
-                      <button
-                        type="button"
-                        onClick={() => setCancelConfirmCaseId(selectedDashboardCase.caseId)}
-                        className="w-full py-2.5 px-4 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-semibold text-xs sm:text-sm transition-colors shadow-xs flex items-center justify-center gap-2 cursor-pointer"
-                      >
-                        <CheckCheck className="h-4 w-4" />
-                        <span>Mark Case as Resolved / Completed</span>
-                      </button>
-                    )}
-
                     <div className="flex gap-2">
                       <button
                         type="button"
@@ -4537,47 +4540,6 @@ function CareBridgeApp() {
                     </div>
                   </div>
 
-                </div>
-              </div>
-            )}
-
-            {/* Case Resolution / Cancellation Confirmation Dialog */}
-            {cancelConfirmCaseId && (
-              <div className="fixed inset-0 z-60 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4">
-                <div className="bg-white rounded-3xl shadow-2xl max-w-md w-full p-6 sm:p-7 border border-slate-100 animate-in fade-in duration-200">
-                  <div className="flex items-center gap-3 mb-4">
-                    <div className="h-12 w-12 rounded-2xl bg-amber-50 border border-amber-200 text-amber-600 flex items-center justify-center shrink-0">
-                      <AlertTriangle className="h-6 w-6" />
-                    </div>
-                    <div>
-                      <h3 className="font-bold text-slate-900 text-base sm:text-lg">
-                        Confirm Case Resolution
-                      </h3>
-                      <p className="text-xs text-slate-500 font-mono">Case ID: {cancelConfirmCaseId}</p>
-                    </div>
-                  </div>
-                  <p className="text-xs sm:text-sm text-slate-600 mb-6 leading-relaxed">
-                    Are you sure you want to resolve or cancel this emergency case? Marking this case as completed will notify all hospital triage coordinators, blood banks, oxygen providers, and ambulance units that active emergency dispatch is concluded.
-                  </p>
-                  <div className="flex items-center justify-end gap-3">
-                    <button
-                      type="button"
-                      onClick={() => setCancelConfirmCaseId(null)}
-                      className="px-4 py-2.5 rounded-xl border border-slate-300 hover:bg-slate-100 text-slate-700 font-semibold text-xs sm:text-sm transition-colors cursor-pointer"
-                    >
-                      Keep Active
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        handleMarkCaseCompleted(cancelConfirmCaseId);
-                        setCancelConfirmCaseId(null);
-                      }}
-                      className="px-5 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs sm:text-sm transition-all shadow-sm active:scale-[0.98] cursor-pointer"
-                    >
-                      Yes, Resolve Case
-                    </button>
-                  </div>
                 </div>
               </div>
             )}

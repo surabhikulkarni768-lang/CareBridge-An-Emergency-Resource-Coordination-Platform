@@ -92,7 +92,37 @@ export type CaseStatus =
   | 'DISPATCHED'
   | 'IN_PROGRESS'
   | 'COMPLETED'
-  | 'REJECTED';
+  | 'REJECTED'
+  | 'CANCELLED';
+
+export type EmergencyLifecycleStatus =
+  | 'REQUESTED'
+  | 'UNDER_REVIEW'
+  | 'ASSIGNED'
+  | 'ACCEPTED'
+  | 'RESOURCE_CONFIRMED'
+  | 'DISPATCHED'
+  | 'IN_PROGRESS'
+  | 'COMPLETED'
+  | 'REJECTED'
+  | 'CANCELLED';
+
+export interface EmergencyLifecycleEvent {
+  eventId: string;
+  eventType: 'case_status' | 'request_status' | 'assignment';
+  previousStatus: string;
+  newStatus: string;
+  updatedByUid: string;
+  userRole: string;
+  timestamp: string;
+  reason?: string;
+  requestId?: string;
+  resourceType?: ResourceType;
+  previousProviderUid?: string;
+  newProviderUid?: string;
+  previousProviderName?: string;
+  newProviderName?: string;
+}
 
 export interface EmergencyAuditItem {
   id: string;
@@ -210,6 +240,8 @@ export interface EmergencyCase {
   assignedAmbulanceName?: string;
   estimatedResponseMinutes?: number;
   auditHistory?: EmergencyAuditItem[];
+  lifecycleHistory?: Record<string, EmergencyLifecycleEvent>;
+  resourceRequests?: ResourceRequest[];
   rejectionReason?: string;
   cancellationReason?: string;
   createdAt: string;
@@ -245,7 +277,9 @@ export type RequestStatus =
   | 'RESOURCE_CONFIRMED'
   | 'DISPATCHED'
   | 'IN_PROGRESS'
-  | 'COMPLETED';
+  | 'COMPLETED'
+  | 'REJECTED'
+  | 'CANCELLED';
 
 export interface ResourceRequest {
   requestId: string; // REQ-YYYYMMDD-XXXX
@@ -273,9 +307,13 @@ export interface ResourceRequest {
     estimatedResponseTimeMinutes?: number;
   };
   status: RequestStatus;
+  statusHistory?: Record<string, EmergencyLifecycleEvent>;
+  lastStatusEventId?: string;
   assignedAt?: string;
   assignmentCoordinatorUid?: string;
   lastAssignmentAuditId?: string;
+  respondedByUid?: string;
+  responseDetails?: string;
   rejectionReason?: string;
   respondedAt?: string;
   createdAt: string;
@@ -413,17 +451,28 @@ export interface NotificationItem {
   recipientUid: string;
   type:
     | 'request_received'
+    | 'request_assigned'
     | 'request_accepted'
     | 'request_rejected'
     | 'request_cancelled'
+    | 'emergency_status_updated'
     | 'ambulance_dispatched'
     | 'ambulance_updated'
     | 'provider_verified'
     | 'system_alert';
   title: string;
   message: string;
+  eventId?: string;
+  eventType?: string;
+  emergencyId?: string;
+  previousStatus?: string;
+  newStatus?: string;
   relatedCaseId?: string;
   relatedRequestId?: string;
+  resourceType?: ResourceRequest['resourceType'];
+  resourceDetails?: ResourceRequest['details'];
+  actorUid?: string;
+  details?: string;
   isRead: boolean;
   createdAt: string;
 }

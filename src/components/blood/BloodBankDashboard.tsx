@@ -15,19 +15,24 @@ import {
 } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
 import { dataStore, respondToRequestInFirestore, subscribeRequestsForProviderFromFirestore } from '../../services/dataService';
+import { ProviderRequestsPanel } from '../common/ProviderRequestsPanel';
 import type { BloodBankProfile, ResourceRequest, BloodGroup } from '../../types';
 
 export const BloodBankDashboard: React.FC = () => {
   const { currentUser } = useAuth();
   const [profile, setProfile] = useState<BloodBankProfile | null>(null);
   const [requests, setRequests] = useState<ResourceRequest[]>([]);
+  const [requestsLoading, setRequestsLoading] = useState(true);
+  const [requestsError, setRequestsError] = useState<string | null>(null);
   const [inventory, setInventory] = useState<Record<BloodGroup, number>>({
     'A+': 18, 'A-': 5, 'B+': 24, 'B-': 3, 'AB+': 9, 'AB-': 2, 'O+': 31, 'O-': 6
   });
   const [isUpdating, setIsUpdating] = useState(false);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [rejectingReqId, setRejectingReqId] = useState<string | null>(null);
-  const [rejectionReason, setRejectionReason] = useState<string>('Selected blood group currently out of stock');
+  const [rejectionReason, setRejectionReason] = useState<string>('');
+  const [respondingReqId, setRespondingReqId] = useState<string | null>(null);
+  const isActionRequired = (status: string) => ['pending', 'assigned', 'requested'].includes(status.toLowerCase());
 
   const loadData = () => {
     if (!currentUser) return;
@@ -42,7 +47,19 @@ export const BloodBankDashboard: React.FC = () => {
     if (!currentUser) return;
     loadData();
     const unsubscribeStore = dataStore.subscribe(loadData);
-    const unsubscribeRequests = subscribeRequestsForProviderFromFirestore(currentUser.uid, setRequests);
+    const unsubscribeRequests = subscribeRequestsForProviderFromFirestore(
+      currentUser.uid,
+      (nextRequests) => {
+        setRequests(nextRequests);
+        setRequestsLoading(false);
+        setRequestsError(null);
+      },
+      (message) => {
+        setRequests([]);
+        setRequestsError(message);
+        setRequestsLoading(false);
+      }
+    );
     return () => {
       unsubscribeStore();
       unsubscribeRequests();
@@ -67,8 +84,6 @@ export const BloodBankDashboard: React.FC = () => {
     }, 400);
   };
 
-  const isActionRequired = (status: string) => status === 'pending' || status === 'ASSIGNED' || status === 'REQUESTED';
-
   const handleAccept = async (reqId: string) => {
     const req = requests.find((r) => r.requestId === reqId);
     if (!req) return;
@@ -76,36 +91,57 @@ export const BloodBankDashboard: React.FC = () => {
     const units = req.details.units || 1;
 
     if (bg && (inventory[bg] || 0) < units) {
-      alert(`Critical Shortage Alert: Requested ${units} units of ${bg}, but only ${inventory[bg] || 0} units are currently available in inventory. Please replenish stock or reject to notify Central Coordinator.`);
+      alert(`Critical shortage: Requested ${units} units of ${bg}, but only ${inventory[bg] || 0} are currently available. Update inventory before accepting.`);
       return;
     }
 
+    setRespondingReqId(reqId);
     try {
-      await respondToRequestInFirestore(reqId, 'accepted');
-      setSuccessMessage(`Blood request accepted. ${units} units of ${bg} reserved & deducted from stock.`);
+      const coordinatorNotified = await respondToRequestInFirestore(reqId, 'accepted');
+      setSuccessMessage(coordinatorNotified
+        ? 'Blood request accepted. The coordinator was notified.'
+        : 'Blood request accepted. The status is visible in the coordinator live request list.');
       setTimeout(() => setSuccessMessage(null), 3000);
     } catch (error) {
       window.alert(error instanceof Error ? error.message : 'Could not respond to the request.');
+    } finally {
+      setRespondingReqId(null);
     }
   };
 
   const handleReject = async (reqId: string) => {
+    if (rejectionReason.trim().length < 5) {
+      window.alert('Enter a rejection reason of at least five characters.');
+      return;
+    }
+    setRespondingReqId(reqId);
     try {
-      await respondToRequestInFirestore(reqId, 'rejected', rejectionReason);
+      const coordinatorNotified = await respondToRequestInFirestore(reqId, 'rejected', rejectionReason.trim());
       setRejectingReqId(null);
-      setSuccessMessage('Blood request declined. Central Coordinator notified.');
+      setRejectionReason('');
+      setSuccessMessage(coordinatorNotified
+        ? 'Blood request declined. The coordinator was notified.'
+        : 'Blood request declined. The status is visible in the coordinator live request list.');
       setTimeout(() => setSuccessMessage(null), 3000);
     } catch (error) {
       window.alert(error instanceof Error ? error.message : 'Could not respond to the request.');
+    } finally {
+      setRespondingReqId(null);
     }
   };
 
   if (!profile) {
-    return <div className="p-8 text-center text-slate-500">Loading Blood Bank Dashboard...</div>;
+    return (
+      <div className="max-w-7xl mx-auto p-8 space-y-4 text-center text-slate-500">
+        Loading Blood Bank Dashboard...
+        {requestsError && <p role="alert" className="text-sm text-red-700">{requestsError}</p>}
+        {currentUser && <ProviderRequestsPanel providerUid={currentUser.uid} title="Assigned Blood Requests" />}
+      </div>
+    );
   }
 
   const bloodGroups: BloodGroup[] = ['A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-'];
-  const pendingRequests = requests.filter((r) => r.status === 'pending');
+  const pendingRequests = requests.filter((r) => isActionRequired(String(r.status)));
 
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6">
@@ -246,7 +282,11 @@ export const BloodBankDashboard: React.FC = () => {
           </h2>
         </div>
 
-        {requests.length === 0 ? (
+        {requestsError ? (
+          <div role="alert" className="rounded-lg border border-red-200 bg-red-50 p-3 text-xs text-red-800">{requestsError}</div>
+        ) : requestsLoading ? (
+          <div className="py-8 text-center text-slate-500 text-xs">Loading assigned blood requests...</div>
+        ) : requests.length === 0 ? (
           <div className="py-8 text-center text-slate-400 text-xs">
             No blood requests received yet.
           </div>
@@ -263,6 +303,9 @@ export const BloodBankDashboard: React.FC = () => {
                     <span className="text-xs font-mono bg-slate-200 text-slate-700 px-1.5 py-0.5 rounded">
                       {req.caseId}
                     </span>
+                    <span className="text-xs font-bold text-amber-800 bg-amber-100 px-2 py-0.5 rounded">
+                      Priority: {req.details.urgency || 'Not specified'}
+                    </span>
                     <span className="text-xs font-bold text-rose-700 bg-rose-100 px-2 py-0.5 rounded">
                       Group {req.details.bloodGroup} — {req.details.units || 1} Units
                     </span>
@@ -270,27 +313,41 @@ export const BloodBankDashboard: React.FC = () => {
                   <p className="text-xs text-slate-500 mt-1">
                     {req.details.notes ? `Note: "${req.details.notes}"` : 'Emergency transfusion requested.'}
                   </p>
+                  <p className="mt-1 text-[11px] text-slate-500">
+                    Assigned: {new Date(req.assignedAt || req.createdAt).toLocaleString()}
+                  </p>
+                  {req.respondedAt && (
+                    <p className="mt-1 text-[11px] text-slate-500">
+                      Response {new Date(req.respondedAt).toLocaleString()} by {req.respondedByUid || 'provider'}
+                      {req.responseDetails ? ` - ${req.responseDetails}` : ''}
+                    </p>
+                  )}
                 </div>
 
                 <div className="flex items-center gap-2 self-end sm:self-auto">
-                  {isActionRequired(req.status) ? (
+                  {isActionRequired(String(req.status)) ? (
                     <>
                       <button
-                        onClick={() => setRejectingReqId(req.requestId)}
+                        disabled={respondingReqId !== null}
+                        onClick={() => {
+                          setRejectionReason('');
+                          setRejectingReqId(req.requestId);
+                        }}
                         className="px-3 py-1.5 text-xs font-bold text-red-600 hover:bg-red-50 rounded-lg border border-red-200"
                       >
                         Decline
                       </button>
                       <button
+                        disabled={respondingReqId !== null}
                         onClick={() => handleAccept(req.requestId)}
                         className="px-4 py-1.5 text-xs font-bold text-white bg-rose-600 hover:bg-rose-700 rounded-lg shadow-xs flex items-center gap-1"
                       >
-                        <CheckCircle2 className="w-3.5 h-3.5" /> Accept & Reserve Units
+                        <CheckCircle2 className="w-3.5 h-3.5" /> Accept Request
                       </button>
                     </>
                   ) : req.status === 'accepted' ? (
                     <span className="text-xs font-bold text-emerald-700 bg-emerald-100 px-2.5 py-1 rounded-full flex items-center gap-1">
-                      <CheckCircle2 className="w-3.5 h-3.5" /> Units Reserved & Ready
+                      <CheckCircle2 className="w-3.5 h-3.5" /> Accepted
                     </span>
                   ) : (
                     <span className="text-xs font-bold text-red-700 bg-red-100 px-2.5 py-1 rounded-full flex items-center gap-1">
@@ -298,6 +355,30 @@ export const BloodBankDashboard: React.FC = () => {
                     </span>
                   )}
                 </div>
+                {rejectingReqId === req.requestId && (
+                  <div className="w-full space-y-2 rounded-lg border border-red-200 bg-red-50 p-3">
+                    <label htmlFor={`blood-rejection-${req.requestId}`} className="block text-xs font-semibold text-red-900">
+                      Rejection reason (required)
+                    </label>
+                    <textarea
+                      id={`blood-rejection-${req.requestId}`}
+                      required
+                      minLength={5}
+                      rows={2}
+                      value={rejectionReason}
+                      onChange={(event) => setRejectionReason(event.target.value)}
+                      className="w-full rounded-lg border border-red-200 bg-white p-2 text-xs"
+                    />
+                    <div className="flex justify-end gap-2">
+                      <button type="button" disabled={respondingReqId !== null} onClick={() => setRejectingReqId(null)} className="rounded-lg px-3 py-1.5 text-xs text-slate-600 hover:bg-white">
+                        Cancel
+                      </button>
+                      <button type="button" disabled={respondingReqId !== null || rejectionReason.trim().length < 5} onClick={() => handleReject(req.requestId)} className="rounded-lg bg-red-600 px-3 py-1.5 text-xs font-bold text-white disabled:opacity-50">
+                        {respondingReqId === req.requestId ? 'Saving...' : 'Confirm rejection'}
+                      </button>
+                    </div>
+                  </div>
+                )}
               </div>
             ))}
           </div>
