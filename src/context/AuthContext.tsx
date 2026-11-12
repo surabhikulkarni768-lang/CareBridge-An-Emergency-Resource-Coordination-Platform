@@ -23,6 +23,27 @@ import { auth, db, isFirebaseConfigured } from '../config/firebase';
 import { dataStore } from '../services/dataService';
 import type { UserProfile, UserRole } from '../types';
 
+const DIRECTORY_ROLES: UserRole[] = ['hospital', 'bloodBank', 'oxygenProvider', 'ambulanceProvider', 'doctor'];
+
+const syncProviderDirectory = async (profile: UserProfile) => {
+  if (!isFirebaseConfigured || !db || !DIRECTORY_ROLES.includes(profile.role)) return;
+
+  await setDoc(
+    doc(db, 'providerDirectory', profile.uid),
+    {
+      uid: profile.uid,
+      role: profile.role,
+      displayName: profile.displayName,
+      city: profile.city,
+      hospitalAffiliation: profile.hospitalAffiliation || '',
+      isVerified: profile.isVerified,
+      isActive: profile.isActive,
+      updatedAt: new Date().toISOString()
+    },
+    { merge: true }
+  );
+};
+
 interface AuthContextType {
   currentUser: UserProfile | null;
   firebaseUser: FirebaseUser | null;
@@ -109,6 +130,13 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
             dataStore.saveUser(userProfile);
           }
 
+          if (isFirebaseConfigured && db) {
+            try {
+              await syncProviderDirectory(userProfile);
+            } catch (directoryError) {
+              console.error('[CareBridge Auth] Provider directory sync failed:', directoryError);
+            }
+          }
           setCurrentUser(userProfile);
         } catch (e: any) {
           console.error('[CareBridge Auth] Error resolving user profile:', e);
@@ -174,6 +202,11 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
           return false;
         }
 
+        try {
+          await syncProviderDirectory(profile);
+        } catch (directoryError) {
+          console.error('[CareBridge Auth] Provider directory sync failed:', directoryError);
+        }
         setCurrentUser(profile);
         return true;
       }
@@ -248,7 +281,7 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
         }
       }
 
-      const isHealthcareProvider = ['hospital', 'bloodBank', 'oxygenProvider', 'ambulanceProvider'].includes(params.role);
+      const isHealthcareProvider = DIRECTORY_ROLES.includes(params.role);
 
       const newProfile: UserProfile = {
         uid,
@@ -294,8 +327,10 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
               lastUpdated: new Date().toISOString()
             });
           }
+          await syncProviderDirectory(newProfile);
         } catch (err) {
-          console.warn('[CareBridge Auth] Firestore profile write note:', err);
+          console.error('[CareBridge Auth] Firestore profile write failed:', err);
+          throw err;
         }
       }
 
@@ -373,7 +408,10 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     if (isFirebaseConfigured && db) {
       try {
         await setDoc(doc(db, 'users', currentUser.uid), updated, { merge: true });
-      } catch (e) {}
+        await syncProviderDirectory(updated);
+      } catch (e) {
+        console.error('[CareBridge Auth] Profile update failed:', e);
+      }
     }
     dataStore.saveUser(updated);
   };

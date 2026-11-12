@@ -2,19 +2,14 @@ import React, { useState, useEffect } from 'react';
 import {
   Shield,
   Users,
-  Building2,
   Activity,
   AlertTriangle,
   CheckCircle2,
-  XCircle,
   Search,
-  Filter,
   Check,
   X,
   RefreshCw,
-  Phone,
   MapPin,
-  Clock,
   Lock,
   Unlock
 } from 'lucide-react';
@@ -22,41 +17,113 @@ import { useAuth } from '../../context/AuthContext';
 import { dataStore } from '../../services/dataService';
 import type { UserProfile, UserRole, EmergencyCase, ResourceRequest } from '../../types';
 
+type CoordinatorResourceFilter = 'all' | 'hospital' | 'blood' | 'oxygen' | 'ambulance' | 'doctor';
+
+const resourceGroups: { id: Exclude<CoordinatorResourceFilter, 'all'>; label: string; resourceTypes: ResourceRequest['resourceType'][] }[] = [
+  { id: 'hospital', label: 'Hospital', resourceTypes: ['bed', 'icu'] },
+  { id: 'blood', label: 'Blood', resourceTypes: ['blood'] },
+  { id: 'oxygen', label: 'Oxygen', resourceTypes: ['oxygen'] },
+  { id: 'ambulance', label: 'Ambulance', resourceTypes: ['ambulance'] },
+  { id: 'doctor', label: 'Doctor', resourceTypes: ['doctor'] }
+];
+
+const formatDate = (date: string) => {
+  const parsed = new Date(date);
+  return Number.isNaN(parsed.getTime()) ? 'Date unavailable' : parsed.toLocaleString();
+};
+
 export const AdminDashboard: React.FC = () => {
   const { currentUser } = useAuth();
   const [users, setUsers] = useState<UserProfile[]>([]);
   const [cases, setCases] = useState<EmergencyCase[]>([]);
   const [requests, setRequests] = useState<ResourceRequest[]>([]);
+  const [coordinatorLoading, setCoordinatorLoading] = useState(true);
+  const [coordinatorError, setCoordinatorError] = useState<string | null>(null);
+  const [coordinatorRefresh, setCoordinatorRefresh] = useState(0);
+  const [priorityFilter, setPriorityFilter] = useState('all');
+  const [statusFilter, setStatusFilter] = useState('all');
+  const [resourceFilter, setResourceFilter] = useState<CoordinatorResourceFilter>('all');
+  const [dateFromFilter, setDateFromFilter] = useState('');
+  const [dateToFilter, setDateToFilter] = useState('');
+  const [expandedCaseId, setExpandedCaseId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [roleFilter, setRoleFilter] = useState<string>('all');
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
-
-  const loadData = () => {
-    setUsers(dataStore.getUsers());
-    setCases(dataStore.getCases());
-    setRequests(dataStore.getRequests());
-  };
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [verifyingUid, setVerifyingUid] = useState<string | null>(null);
 
   useEffect(() => {
-    loadData();
-    const unsub = dataStore.subscribe(loadData);
-    return () => unsub();
-  }, [currentUser]);
+    if (!currentUser || currentUser.role !== 'admin') {
+      setCases([]);
+      setRequests([]);
+      setCoordinatorLoading(false);
+      setCoordinatorError('Coordinator data requires an authenticated admin account.');
+      return;
+    }
 
-  const handleVerify = (uid: string, verify: boolean) => {
-    dataStore.verifyProvider(uid, verify);
-    setSuccessMessage(verify ? 'Provider organization verified successfully.' : 'Verification revoked.');
-    setTimeout(() => setSuccessMessage(null), 3000);
+    let receivedUsers = false;
+    let receivedCases = false;
+    let receivedRequests = false;
+    setCoordinatorLoading(true);
+    setCoordinatorError(null);
+    const unsubscribe = dataStore.subscribeToCoordinatorCasesAndRequests(
+      (records) => {
+        setUsers(records);
+        receivedUsers = true;
+        if (receivedCases && receivedRequests) setCoordinatorLoading(false);
+      },
+      (records) => {
+        setCases(records);
+        receivedCases = true;
+        if (receivedUsers && receivedRequests) setCoordinatorLoading(false);
+      },
+      (records) => {
+        setRequests(records);
+        receivedRequests = true;
+        if (receivedUsers && receivedCases) setCoordinatorLoading(false);
+      },
+      (message) => {
+        setCoordinatorError(message);
+        setCoordinatorLoading(false);
+      }
+    );
+    return unsubscribe;
+  }, [currentUser?.uid, currentUser?.role, coordinatorRefresh]);
+
+  const handleVerify = async (uid: string, verify: boolean) => {
+    setSuccessMessage(null);
+    setErrorMessage(null);
+    setVerifyingUid(uid);
+    try {
+      await dataStore.verifyProvider(uid, verify);
+      setSuccessMessage(verify ? 'Provider organization verified successfully.' : 'Verification revoked.');
+      setTimeout(() => setSuccessMessage(null), 3000);
+    } catch (error) {
+      console.error('[CareBridge Admin] Provider verification update failed:', error);
+      setErrorMessage(error instanceof Error ? error.message : 'Provider verification could not be updated.');
+    } finally {
+      setVerifyingUid(null);
+    }
   };
 
-  const handleToggleActive = (uid: string, currentActive: boolean) => {
-    dataStore.toggleUserActive(uid, !currentActive);
-    setSuccessMessage(!currentActive ? 'Account activated.' : 'Account suspended.');
-    setTimeout(() => setSuccessMessage(null), 3000);
+  const handleToggleActive = async (uid: string, currentActive: boolean) => {
+    setSuccessMessage(null);
+    setErrorMessage(null);
+    setVerifyingUid(uid);
+    try {
+      await dataStore.toggleUserActive(uid, !currentActive);
+      setSuccessMessage(!currentActive ? 'Account activated.' : 'Account suspended.');
+      setTimeout(() => setSuccessMessage(null), 3000);
+    } catch (error) {
+      console.error('[CareBridge Admin] Account status update failed:', error);
+      setErrorMessage(error instanceof Error ? error.message : 'Account status could not be updated.');
+    } finally {
+      setVerifyingUid(null);
+    }
   };
 
   const pendingVerificationProviders = users.filter(
-    (u) => ['hospital', 'bloodBank', 'oxygenProvider', 'ambulanceProvider'].includes(u.role) && !u.isVerified
+    (u) => ['hospital', 'bloodBank', 'oxygenProvider', 'ambulanceProvider', 'doctor'].includes(u.role) && !u.isVerified
   );
 
   const filteredUsers = users.filter((u) => {
@@ -70,6 +137,18 @@ export const AdminDashboard: React.FC = () => {
 
   const activeCasesCount = cases.filter((c) => c.status === 'active').length;
   const pendingRequestsCount = requests.filter((r) => r.status === 'pending').length;
+  const filteredCases = cases.filter((emergencyCase) => {
+    const matchesPriority = priorityFilter === 'all' || emergencyCase.urgencyLevel === priorityFilter;
+    const matchesStatus = statusFilter === 'all' || emergencyCase.status === statusFilter;
+    const createdDate = emergencyCase.createdAt.slice(0, 10);
+    const matchesFrom = !dateFromFilter || createdDate >= dateFromFilter;
+    const matchesTo = !dateToFilter || createdDate <= dateToFilter;
+    const matchesResource = resourceFilter === 'all' || requests.some((request) =>
+      request.caseId === emergencyCase.caseId &&
+      resourceGroups.find((group) => group.id === resourceFilter)?.resourceTypes.includes(request.resourceType)
+    );
+    return matchesPriority && matchesStatus && matchesFrom && matchesTo && matchesResource;
+  });
   const providerCount = users.filter((u) =>
     ['hospital', 'bloodBank', 'oxygenProvider', 'ambulanceProvider'].includes(u.role)
   ).length;
@@ -96,7 +175,7 @@ export const AdminDashboard: React.FC = () => {
         </div>
 
         <button
-          onClick={loadData}
+          onClick={() => setCoordinatorRefresh((value) => value + 1)}
           className="p-2.5 rounded-xl border border-slate-200 text-slate-600 hover:bg-slate-50 self-end sm:self-auto"
         >
           <RefreshCw className="w-4 h-4" />
@@ -107,6 +186,12 @@ export const AdminDashboard: React.FC = () => {
         <div className="p-3 bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs font-semibold rounded-xl flex items-center gap-2">
           <CheckCircle2 className="w-4 h-4 text-emerald-600" />
           {successMessage}
+        </div>
+      )}
+      {errorMessage && (
+        <div role="alert" className="p-3 bg-red-50 border border-red-200 text-red-800 text-xs font-semibold rounded-xl flex items-center gap-2">
+          <AlertTriangle className="w-4 h-4 text-red-600" />
+          {errorMessage}
         </div>
       )}
 
@@ -133,6 +218,152 @@ export const AdminDashboard: React.FC = () => {
           <div className="text-[11px] text-teal-500 mt-0.5">Hospitals, Banks, Oxygen, Fleet</div>
         </div>
       </div>
+
+      <section className="bg-white rounded-2xl p-6 border border-slate-200 shadow-sm space-y-4">
+        <div className="flex flex-col gap-1 border-b border-slate-100 pb-3">
+          <h2 className="text-base font-bold text-slate-900 flex items-center gap-2">
+            <Activity className="w-5 h-5 text-red-600" /> Central Emergency Coordination
+          </h2>
+          <p className="text-xs text-slate-500">Live emergency cases and linked resource requests from Firestore.</p>
+        </div>
+
+        <div className="grid grid-cols-2 lg:grid-cols-5 gap-2">
+          <select aria-label="Filter by priority" value={priorityFilter} onChange={(event) => setPriorityFilter(event.target.value)} className="text-xs p-2 bg-slate-50 border border-slate-200 rounded-lg">
+            <option value="all">All priorities</option>
+            {Array.from(new Set(cases.map((record) => record.urgencyLevel))).filter(Boolean).map((priority) => (
+              <option key={priority} value={priority}>{priority}</option>
+            ))}
+          </select>
+          <select aria-label="Filter by emergency status" value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)} className="text-xs p-2 bg-slate-50 border border-slate-200 rounded-lg">
+            <option value="all">All statuses</option>
+            {Array.from(new Set(cases.map((record) => record.status))).filter(Boolean).map((status) => (
+              <option key={status} value={status}>{status}</option>
+            ))}
+          </select>
+          <select aria-label="Filter by resource type" value={resourceFilter} onChange={(event) => setResourceFilter(event.target.value as CoordinatorResourceFilter)} className="text-xs p-2 bg-slate-50 border border-slate-200 rounded-lg">
+            <option value="all">All resource types</option>
+            {resourceGroups.map((group) => <option key={group.id} value={group.id}>{group.label}</option>)}
+          </select>
+          <label className="text-[11px] text-slate-500">
+            From
+            <input aria-label="Filter emergencies from date" type="date" value={dateFromFilter} onChange={(event) => setDateFromFilter(event.target.value)} className="block w-full text-xs p-1.5 bg-slate-50 border border-slate-200 rounded-lg" />
+          </label>
+          <label className="text-[11px] text-slate-500">
+            To
+            <input aria-label="Filter emergencies through date" type="date" value={dateToFilter} onChange={(event) => setDateToFilter(event.target.value)} className="block w-full text-xs p-1.5 bg-slate-50 border border-slate-200 rounded-lg" />
+          </label>
+        </div>
+
+        {coordinatorError && (
+          <div role="alert" className="p-3 bg-red-50 border border-red-200 text-red-800 text-xs rounded-xl flex items-center gap-2">
+            <AlertTriangle className="w-4 h-4 shrink-0" /> {coordinatorError}
+          </div>
+        )}
+        {coordinatorLoading ? (
+          <div className="py-8 text-center text-slate-500 text-sm">Loading Firestore emergency data...</div>
+        ) : !coordinatorError && filteredCases.length === 0 ? (
+          <div className="py-8 text-center text-slate-400 text-sm">
+            {cases.length === 0 ? 'No emergency cases are currently available.' : 'No cases match the selected filters.'}
+          </div>
+        ) : (
+          <div className="space-y-4">
+            {filteredCases.map((emergencyCase) => {
+              const caseRequests = requests.filter((request) => request.caseId === emergencyCase.caseId);
+              const groups = resourceFilter === 'all'
+                ? resourceGroups
+                : resourceGroups.filter((group) => group.id === resourceFilter);
+              return (
+                <article key={emergencyCase.caseId} className="rounded-xl border border-slate-200 overflow-hidden">
+                  <div className="p-4 bg-slate-50/70 grid sm:grid-cols-2 lg:grid-cols-4 gap-3">
+                    <div>
+                      <div className="text-[10px] uppercase tracking-wide text-slate-400">Emergency ID</div>
+                      <div className="text-xs font-bold font-mono text-slate-900">{emergencyCase.caseId}</div>
+                    </div>
+                    <div>
+                      <div className="text-[10px] uppercase tracking-wide text-slate-400">Patient</div>
+                      <div className="text-xs font-semibold text-slate-900">{emergencyCase.patientName || 'Patient details unavailable'}</div>
+                      <div className="text-[11px] text-slate-500">
+                        {[emergencyCase.patientAge && `${emergencyCase.patientAge} years`, emergencyCase.patientGender].filter(Boolean).join(' · ') || 'Details unavailable'}
+                      </div>
+                      <div className="text-[10px] text-slate-400 font-mono">{emergencyCase.patientUid}</div>
+                    </div>
+                    <div>
+                      <div className="text-[10px] uppercase tracking-wide text-slate-400">Category / Priority</div>
+                      <div className="text-xs font-semibold text-slate-800">{emergencyCase.conditionSummary || 'Unspecified'} · {emergencyCase.urgencyLevel || 'Unspecified'}</div>
+                    </div>
+                    <div>
+                      <div className="text-[10px] uppercase tracking-wide text-slate-400">Status / Created</div>
+                      <div className="text-xs font-semibold capitalize text-slate-800">{emergencyCase.status}</div>
+                      <div className="text-[11px] text-slate-500">{formatDate(emergencyCase.createdAt)}</div>
+                    </div>
+                    <div className="sm:col-span-2 lg:col-span-4 flex items-start gap-1.5 text-xs text-slate-600">
+                      <MapPin className="w-3.5 h-3.5 text-slate-400 shrink-0 mt-0.5" />
+                      {emergencyCase.location?.address || emergencyCase.location?.city || 'Location unavailable'}
+                    </div>
+                    <div className="sm:col-span-2 lg:col-span-4 flex justify-end">
+                      <button
+                        type="button"
+                        onClick={() => setExpandedCaseId((current) => current === emergencyCase.caseId ? null : emergencyCase.caseId)}
+                        aria-expanded={expandedCaseId === emergencyCase.caseId}
+                        className="text-xs font-semibold text-purple-700 hover:text-purple-900"
+                      >
+                        {expandedCaseId === emergencyCase.caseId ? 'Hide emergency details' : 'Open emergency details'}
+                      </button>
+                    </div>
+                  </div>
+
+                  {expandedCaseId === emergencyCase.caseId && (
+                    <div className="px-4 py-3 bg-purple-50/50 border-t border-purple-100 grid sm:grid-cols-2 gap-3 text-xs">
+                      <div>
+                        <div className="text-[10px] uppercase tracking-wide text-slate-400">Emergency description</div>
+                        <p className="text-slate-700 mt-1">{emergencyCase.conditionSummary || 'No description provided.'}</p>
+                      </div>
+                      <div>
+                        <div className="text-[10px] uppercase tracking-wide text-slate-400">Resources requested</div>
+                        <p className="text-slate-700 mt-1">{emergencyCase.resourcesNeeded?.join(', ') || 'None specified'}</p>
+                      </div>
+                      {emergencyCase.attendant && (
+                        <div>
+                          <div className="text-[10px] uppercase tracking-wide text-slate-400">Attendant</div>
+                          <p className="text-slate-700 mt-1">{emergencyCase.attendant.name} ({emergencyCase.attendant.relation}) · {emergencyCase.attendant.phone}</p>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  <div className="p-4 space-y-3">
+                    <h3 className="text-xs font-bold uppercase tracking-wide text-slate-600">Resource requests</h3>
+                    {groups.map((group) => {
+                      const groupRequests = caseRequests.filter((request) => group.resourceTypes.includes(request.resourceType));
+                      return (
+                        <div key={group.id} className="rounded-lg border border-slate-100">
+                          <div className="px-3 py-2 bg-slate-50 text-xs font-bold text-slate-700">
+                            {group.label} <span className="text-slate-400 font-medium">({groupRequests.length})</span>
+                          </div>
+                          {groupRequests.length === 0 ? (
+                            <div className="px-3 py-2 text-[11px] text-slate-400">No {group.label.toLowerCase()} request for this case.</div>
+                          ) : (
+                            <div className="divide-y divide-slate-100">
+                              {groupRequests.map((request) => (
+                                <div key={request.requestId} className="px-3 py-2 grid sm:grid-cols-4 gap-2 text-[11px]">
+                                  <div><span className="text-slate-400">Provider: </span><span className="font-semibold text-slate-700">{request.providerName || request.providerUid || 'Unassigned'}</span></div>
+                                  <div><span className="text-slate-400">Type: </span><span className="text-slate-700 capitalize">{request.resourceType}</span></div>
+                                  <div><span className="text-slate-400">Status: </span><span className="text-slate-700 capitalize">{request.status}</span></div>
+                                  <div><span className="text-slate-400">Updated: </span><span className="text-slate-700">{request.updatedAt ? formatDate(request.updatedAt) : 'Not recorded'}</span></div>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </article>
+              );
+            })}
+          </div>
+        )}
+      </section>
 
       {/* Provider Verification Queue (Task 16 Requirement) */}
       <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-sm space-y-4">
@@ -180,14 +411,16 @@ export const AdminDashboard: React.FC = () => {
 
                 <div className="flex items-center gap-2">
                   <button
-                    onClick={() => handleVerify(prov.uid, false)}
-                    className="px-3.5 py-1.5 text-xs font-semibold text-red-600 hover:bg-red-50 rounded-lg border border-red-200"
+                    onClick={() => void handleVerify(prov.uid, false)}
+                    disabled={verifyingUid === prov.uid}
+                    className="px-3.5 py-1.5 text-xs font-semibold text-red-600 hover:bg-red-50 disabled:opacity-50 rounded-lg border border-red-200"
                   >
                     Reject
                   </button>
                   <button
-                    onClick={() => handleVerify(prov.uid, true)}
-                    className="px-4 py-1.5 text-xs font-bold text-white bg-teal-600 hover:bg-teal-700 rounded-lg shadow-xs flex items-center gap-1.5"
+                    onClick={() => void handleVerify(prov.uid, true)}
+                    disabled={verifyingUid === prov.uid}
+                    className="px-4 py-1.5 text-xs font-bold text-white bg-teal-600 hover:bg-teal-700 disabled:opacity-50 rounded-lg shadow-xs flex items-center gap-1.5"
                   >
                     <Check className="w-3.5 h-3.5" /> Approve & Verify
                   </button>
@@ -267,12 +500,24 @@ export const AdminDashboard: React.FC = () => {
                   </td>
                   <td className="p-3">
                     {u.isVerified ? (
-                      <span className="inline-flex items-center gap-1 font-bold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded text-[11px]">
-                        <CheckCircle2 className="w-3 h-3" /> Verified
-                      </span>
+                      <div className="inline-flex items-center gap-2">
+                        <span className="inline-flex items-center gap-1 font-bold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded text-[11px]">
+                          <CheckCircle2 className="w-3 h-3" /> Verified
+                        </span>
+                        {['hospital', 'bloodBank', 'oxygenProvider', 'ambulanceProvider', 'doctor'].includes(u.role) && (
+                          <button
+                            onClick={() => void handleVerify(u.uid, false)}
+                            disabled={verifyingUid === u.uid}
+                            className="text-[11px] font-semibold text-red-600 hover:text-red-800 disabled:opacity-50"
+                          >
+                            Revoke
+                          </button>
+                        )}
+                      </div>
                     ) : (
                       <button
-                        onClick={() => handleVerify(u.uid, true)}
+                        onClick={() => void handleVerify(u.uid, true)}
+                        disabled={verifyingUid === u.uid}
                         className="text-[11px] font-bold text-amber-700 bg-amber-50 hover:bg-amber-100 px-2 py-0.5 rounded"
                       >
                         Pending (Verify)
@@ -290,8 +535,9 @@ export const AdminDashboard: React.FC = () => {
                   </td>
                   <td className="p-3 text-right">
                     <button
-                      onClick={() => handleToggleActive(u.uid, u.isActive)}
-                      className={`p-1.5 rounded-lg text-xs font-semibold transition-colors ${
+                      onClick={() => void handleToggleActive(u.uid, u.isActive)}
+                      disabled={verifyingUid === u.uid}
+                      className={`p-1.5 rounded-lg text-xs font-semibold transition-colors disabled:opacity-50 ${
                         u.isActive
                           ? 'text-red-600 hover:bg-red-50'
                           : 'text-emerald-600 hover:bg-emerald-50'
@@ -310,4 +556,3 @@ export const AdminDashboard: React.FC = () => {
     </div>
   );
 };
-

@@ -51,19 +51,27 @@ export interface EmergencyCase {
     relation: string;
     phone: string;
   };
+  attendantConsent?: {
+    granted: boolean;
+    givenByUid: string;
+    grantedAt: string;
+  };
+  submissionFingerprint?: string;
+  matchedHospitalName?: string;
   status: CaseStatus;
   requestCount: number;
   createdAt: string;
   updatedAt: string;
 }
 
-export type ResourceType = 'bed' | 'icu' | 'blood' | 'oxygen' | 'ambulance';
+export type ResourceType = 'bed' | 'icu' | 'blood' | 'oxygen' | 'ambulance' | 'doctor';
 export type RequestStatus = 'pending' | 'accepted' | 'rejected' | 'cancelled' | 'completed';
 
 export interface ResourceRequest {
   requestId: string; // REQ-YYYYMMDD-XXXX
   caseId: string;
   patientUid: string;
+  requesterUid: string;
   patientName?: string;
   providerUid: string;
   providerName: string;
@@ -232,4 +240,3 @@ export interface ClinicalNote {
   };
   createdAt: string;
 }
-

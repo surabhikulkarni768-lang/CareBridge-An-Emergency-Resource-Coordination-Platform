@@ -10,19 +10,20 @@
 
 import {
   collection,
+  collectionGroup,
   doc,
   getDoc,
   getDocs,
   setDoc,
+  writeBatch,
   updateDoc,
   onSnapshot,
   query,
   where,
-  orderBy,
   serverTimestamp,
   type Unsubscribe
 } from 'firebase/firestore';
-import { db, isFirebaseConfigured } from '../config/firebase';
+import { auth, db, isFirebaseConfigured } from '../config/firebase';
 import type {
   EmergencyCase,
   ResourceRequest,
@@ -37,6 +38,37 @@ import type {
   ClinicalNote,
   AmbulanceTripStatus
 } from '../types';
+
+export interface ResourceRequestDraft {
+  resourceType: ResourceRequest['resourceType'];
+  providerRole: UserRole;
+  details: ResourceRequest['details'];
+}
+
+interface ProviderDirectoryEntry {
+  uid: string;
+  role: UserRole;
+  displayName: string;
+  city: string;
+  hospitalAffiliation?: string;
+  isVerified: boolean;
+  isActive: boolean;
+}
+
+export interface PatientAttendantLink {
+  attendantUid: string;
+  activeConsent: boolean;
+  updatedAt: string;
+}
+
+const firestoreDateToIso = (value: unknown): string => {
+  if (typeof value === 'string' && !Number.isNaN(Date.parse(value))) return value;
+  if (value && typeof value === 'object' && 'toDate' in value && typeof value.toDate === 'function') {
+    const date = value.toDate() as Date;
+    if (!Number.isNaN(date.getTime())) return date.toISOString();
+  }
+  throw new Error('A Firestore emergency record has an invalid timestamp.');
+};
 
 // ==========================================
 // SEEDED DEMO DATASET
@@ -278,6 +310,7 @@ export const INITIAL_REQUESTS: ResourceRequest[] = [
     requestId: 'REQ-20261108-0101',
     caseId: 'CB-20261108-0042',
     patientUid: 'patient-demo-01',
+    requesterUid: 'patient-demo-01',
     patientName: 'Rahul Deshpande',
     providerUid: 'hosp-demo-01',
     providerName: 'KIMS Super Specialty Hospital',
@@ -292,6 +325,7 @@ export const INITIAL_REQUESTS: ResourceRequest[] = [
     requestId: 'REQ-20261108-0102',
     caseId: 'CB-20261108-0042',
     patientUid: 'patient-demo-01',
+    requesterUid: 'patient-demo-01',
     patientName: 'Rahul Deshpande',
     providerUid: 'blood-demo-01',
     providerName: 'Red Cross Regional Blood Centre',
@@ -306,6 +340,7 @@ export const INITIAL_REQUESTS: ResourceRequest[] = [
     requestId: 'REQ-20261108-0103',
     caseId: 'CB-20261108-0042',
     patientUid: 'patient-demo-01',
+    requesterUid: 'patient-demo-01',
     patientName: 'Rahul Deshpande',
     providerUid: 'oxy-demo-01',
     providerName: 'OxyLife Medical Gas Distributors',
@@ -320,6 +355,7 @@ export const INITIAL_REQUESTS: ResourceRequest[] = [
     requestId: 'REQ-20261108-0104',
     caseId: 'CB-20261108-0042',
     patientUid: 'patient-demo-01',
+    requesterUid: 'patient-demo-01',
     patientName: 'Rahul Deshpande',
     providerUid: 'amb-demo-01',
     providerName: 'SwiftCare Emergency Ambulance Fleet',
@@ -406,6 +442,7 @@ export const INITIAL_NOTIFICATIONS: NotificationItem[] = [
 // ==========================================
 
 const STORAGE_KEY = 'carebridge_unified_store_v2';
+const PROVIDER_ROLES: UserRole[] = ['hospital', 'bloodBank', 'oxygenProvider', 'ambulanceProvider', 'doctor'];
 
 interface StoreState {
   users: UserProfile[];
@@ -503,26 +540,102 @@ class DataStore {
     this.saveState();
   }
 
-  public toggleUserActive(uid: string, isActive: boolean) {
+  public async toggleUserActive(uid: string, isActive: boolean): Promise<void> {
+    if (!isFirebaseConfigured || !db || !auth.currentUser) {
+      throw new Error('An authenticated Firebase administrator is required to change account status.');
+    }
+
+    const adminSnapshot = await getDoc(doc(db, 'users', auth.currentUser.uid));
+    if (!adminSnapshot.exists() || adminSnapshot.data().role !== 'admin') {
+      throw new Error('Only an authorized administrator can change account status.');
+    }
+
+    const userRef = doc(db, 'users', uid);
+    const userSnapshot = await getDoc(userRef);
+    if (!userSnapshot.exists()) {
+      throw new Error('The account could not be found.');
+    }
+
+    const profile = userSnapshot.data() as UserProfile;
+    const now = new Date().toISOString();
+    const batch = writeBatch(db);
+    batch.update(userRef, { isActive, updatedAt: now });
+    if (PROVIDER_ROLES.includes(profile.role)) {
+      batch.set(
+        doc(db, 'providerDirectory', uid),
+        {
+          uid,
+          role: profile.role,
+          displayName: profile.displayName,
+          city: profile.city,
+          hospitalAffiliation: profile.hospitalAffiliation || '',
+          isVerified: profile.isVerified,
+          isActive,
+          updatedAt: now
+        },
+        { merge: true }
+      );
+    }
+    await batch.commit();
+
     const user = this.state.users.find((u) => u.uid === uid);
     if (user) {
       user.isActive = isActive;
-      user.updatedAt = new Date().toISOString();
+      user.updatedAt = now;
       this.saveState();
     }
   }
 
-  public verifyProvider(uid: string, isVerified: boolean) {
+  public async verifyProvider(uid: string, isVerified: boolean): Promise<void> {
+    if (!isFirebaseConfigured || !db || !auth.currentUser) {
+      throw new Error('An authenticated Firebase administrator is required to change provider verification.');
+    }
+
+    const adminSnapshot = await getDoc(doc(db, 'users', auth.currentUser.uid));
+    if (!adminSnapshot.exists() || adminSnapshot.data().role !== 'admin') {
+      throw new Error('Only an authorized administrator can change provider verification.');
+    }
+
+    const providerRef = doc(db, 'users', uid);
+    const providerSnapshot = await getDoc(providerRef);
+    if (!providerSnapshot.exists()) {
+      throw new Error('The provider account could not be found.');
+    }
+
+    const provider = providerSnapshot.data() as UserProfile;
+    if (!PROVIDER_ROLES.includes(provider.role)) {
+      throw new Error('Verification can only be changed for provider accounts.');
+    }
+
+    const now = new Date().toISOString();
+    const batch = writeBatch(db);
+    batch.update(providerRef, { isVerified, updatedAt: now });
+    batch.set(
+      doc(db, 'providerDirectory', uid),
+      {
+        uid,
+        role: provider.role,
+        displayName: provider.displayName,
+        city: provider.city,
+        hospitalAffiliation: provider.hospitalAffiliation || '',
+        isVerified,
+        isActive: provider.isActive,
+        updatedAt: now
+      },
+      { merge: true }
+    );
+    await batch.commit();
+
     const user = this.state.users.find((u) => u.uid === uid);
     if (user) {
       user.isVerified = isVerified;
-      user.updatedAt = new Date().toISOString();
+      user.updatedAt = now;
       if (this.state.hospitalProfiles[uid]) this.state.hospitalProfiles[uid].isVerified = isVerified;
       if (this.state.bloodBankProfiles[uid]) this.state.bloodBankProfiles[uid].isVerified = isVerified;
       if (this.state.oxygenProfiles[uid]) this.state.oxygenProfiles[uid].isVerified = isVerified;
       if (this.state.ambulanceProfiles[uid]) this.state.ambulanceProfiles[uid].isVerified = isVerified;
-      
-      this.addNotification({
+
+      this.state.notifications.unshift({
         id: 'notif-' + Date.now(),
         recipientUid: uid,
         type: 'provider_verified',
@@ -531,7 +644,7 @@ class DataStore {
           ? 'Your healthcare provider organization has been verified by the CareBridge Coordinator.'
           : 'Your provider credentials require re-verification. Contact the administrator.',
         isRead: false,
-        createdAt: new Date().toISOString()
+        createdAt: now
       });
       this.saveState();
     }
@@ -607,9 +720,423 @@ class DataStore {
     return this.state.cases.find((c) => c.caseId === caseId);
   }
 
+  public subscribeToCoordinatorCasesAndRequests(
+    onUsers: (users: UserProfile[]) => void,
+    onCases: (cases: EmergencyCase[]) => void,
+    onRequests: (requests: ResourceRequest[]) => void,
+    onError: (message: string) => void
+  ): Unsubscribe {
+    if (!isFirebaseConfigured || !db) {
+      onError('Coordinator emergency data requires a configured Firebase project.');
+      return () => undefined;
+    }
+    if (!auth.currentUser) {
+      onError('Sign in with an authorized coordinator account to view emergency data.');
+      return () => undefined;
+    }
+
+    const unsubscribeUsers = onSnapshot(collection(db, 'users'), (snapshot) => {
+      try {
+        onUsers(snapshot.docs.map((userSnapshot) => {
+          const data = userSnapshot.data();
+          return {
+            ...data,
+            uid: data.uid || userSnapshot.id,
+            email: data.email || '',
+            displayName: data.displayName || '',
+            city: data.city || '',
+            state: data.state || '',
+            isVerified: data.isVerified === true,
+            isActive: data.isActive === true,
+            profileComplete: data.profileComplete === true,
+            createdAt: data.createdAt ? firestoreDateToIso(data.createdAt) : '',
+            updatedAt: data.updatedAt ? firestoreDateToIso(data.updatedAt) : ''
+          } as UserProfile;
+        }));
+      } catch (error) {
+        onError(error instanceof Error ? error.message : 'The user directory contains invalid data.');
+      }
+    }, (error) => {
+      onError(`Could not load user directory: ${error.message}`);
+    });
+
+    const unsubscribeCases = onSnapshot(collection(db, 'cases'), (snapshot) => {
+      try {
+        onCases(snapshot.docs.map((caseSnapshot) => {
+          const data = caseSnapshot.data();
+          return {
+            ...data,
+            caseId: data.caseId || caseSnapshot.id,
+            createdAt: firestoreDateToIso(data.createdAt),
+            updatedAt: firestoreDateToIso(data.updatedAt ?? data.createdAt)
+          } as EmergencyCase;
+        }));
+      } catch (error) {
+        onError(error instanceof Error ? error.message : 'Emergency cases could not be read.');
+      }
+    }, (error) => {
+      onError(`Could not load emergency cases: ${error.message}`);
+    });
+
+    const unsubscribeRequests = onSnapshot(collection(db, 'requests'), (snapshot) => {
+      try {
+        onRequests(snapshot.docs.map((requestSnapshot) => {
+          const data = requestSnapshot.data();
+          return {
+            ...data,
+            requestId: data.requestId || requestSnapshot.id,
+            createdAt: firestoreDateToIso(data.createdAt),
+            updatedAt: data.updatedAt ? firestoreDateToIso(data.updatedAt) : ''
+          } as ResourceRequest;
+        }));
+      } catch (error) {
+        onError(error instanceof Error ? error.message : 'Resource requests could not be read.');
+      }
+    }, (error) => {
+      onError(`Could not load resource requests: ${error.message}`);
+    });
+
+    return () => {
+      unsubscribeUsers();
+      unsubscribeCases();
+      unsubscribeRequests();
+    };
+  }
+
+  public subscribeToEmergencyHistory(
+    patientUid: string,
+    onCases: (cases: EmergencyCase[]) => void,
+    onError: (message: string) => void
+  ): Unsubscribe {
+    if (!isFirebaseConfigured || !db) {
+      onError('Emergency history requires a configured Firebase project.');
+      return () => undefined;
+    }
+
+    const casesByPatient = new Map<string, Map<string, EmergencyCase>>();
+    const caseSubscriptions = new Map<string, Unsubscribe>();
+    const loadedPatientUids = new Set<string>();
+    let activeLinksLoaded = false;
+    const emitCases = () => {
+      if (!activeLinksLoaded || [...caseSubscriptions.keys()].some((uid) => !loadedPatientUids.has(uid))) return;
+      const cases = [...casesByPatient.values()]
+        .flatMap((patientCases) => [...patientCases.values()])
+        .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+      onCases(cases);
+    };
+    const subscribeToPatientCases = (linkedPatientUid: string) => {
+      if (caseSubscriptions.has(linkedPatientUid)) return;
+      const patientCases = new Map<string, EmergencyCase>();
+      casesByPatient.set(linkedPatientUid, patientCases);
+      const casesQuery = query(collection(db, 'cases'), where('patientUid', '==', linkedPatientUid));
+      const unsubscribe = onSnapshot(casesQuery, (snapshot) => {
+        try {
+          patientCases.clear();
+          snapshot.docs.forEach((caseSnapshot) => {
+            const data = caseSnapshot.data();
+            const caseRecord = {
+              ...data,
+              caseId: data.caseId || caseSnapshot.id,
+              createdAt: firestoreDateToIso(data.createdAt),
+              updatedAt: firestoreDateToIso(data.updatedAt)
+            } as EmergencyCase;
+            patientCases.set(caseRecord.caseId, caseRecord);
+          });
+          loadedPatientUids.add(linkedPatientUid);
+          emitCases();
+        } catch (error) {
+          onError(error instanceof Error ? error.message : 'An emergency record could not be read.');
+        }
+      }, (error) => {
+        onError(`Could not load emergency history: ${error.message}`);
+      });
+      caseSubscriptions.set(linkedPatientUid, unsubscribe);
+    };
+
+    subscribeToPatientCases(patientUid);
+    const linksQuery = query(
+      collectionGroup(db, 'attendants'),
+      where('attendantUid', '==', patientUid),
+      where('activeConsent', '==', true)
+    );
+    const unsubscribeLinks = onSnapshot(linksQuery, (snapshot) => {
+      const linkedPatientUids = new Set(
+        snapshot.docs
+          .map((linkSnapshot) => linkSnapshot.data().patientUid)
+          .filter((linkedPatientUid): linkedPatientUid is string =>
+            typeof linkedPatientUid === 'string' && linkedPatientUid !== patientUid
+          )
+      );
+      activeLinksLoaded = true;
+
+      caseSubscriptions.forEach((unsubscribe, linkedPatientUid) => {
+        if (linkedPatientUid !== patientUid && !linkedPatientUids.has(linkedPatientUid)) {
+          unsubscribe();
+          caseSubscriptions.delete(linkedPatientUid);
+          casesByPatient.delete(linkedPatientUid);
+          loadedPatientUids.delete(linkedPatientUid);
+        }
+      });
+      linkedPatientUids.forEach(subscribeToPatientCases);
+      emitCases();
+    }, (error) => {
+      onError(`Could not load linked-patient history: ${error.message}`);
+    });
+
+    return () => {
+      unsubscribeLinks();
+      caseSubscriptions.forEach((unsubscribe) => unsubscribe());
+      caseSubscriptions.clear();
+      casesByPatient.clear();
+    };
+  }
+
+  public subscribeToPatientAttendants(
+    patientUid: string,
+    onLinks: (links: PatientAttendantLink[]) => void,
+    onError: (message: string) => void
+  ): Unsubscribe {
+    if (!isFirebaseConfigured || !db) {
+      onError('Attendant consent management requires a configured Firebase project.');
+      return () => undefined;
+    }
+
+    return onSnapshot(collection(db, 'users', patientUid, 'attendants'), (snapshot) => {
+      onLinks(snapshot.docs.map((linkSnapshot) => {
+        const data = linkSnapshot.data();
+        return {
+          attendantUid: data.attendantUid || linkSnapshot.id,
+          activeConsent: data.activeConsent === true,
+          updatedAt: firestoreDateToIso(data.updatedAt)
+        };
+      }));
+    }, (error) => {
+      onError(`Could not load attendant consent settings: ${error.message}`);
+    });
+  }
+
+  public async setPatientAttendantConsent(
+    patientUid: string,
+    attendantUid: string,
+    activeConsent: boolean
+  ): Promise<void> {
+    if (!isFirebaseConfigured || !db) {
+      throw new Error('Attendant consent management requires a configured Firebase project.');
+    }
+    if (!auth.currentUser || auth.currentUser.uid !== patientUid) {
+      throw new Error('Only the signed-in patient can manage attendant consent.');
+    }
+    if (!attendantUid.trim() || attendantUid === patientUid) {
+      throw new Error('Enter a different patient’s registered CareBridge account UID.');
+    }
+
+    const linkRef = doc(db, 'users', patientUid, 'attendants', attendantUid);
+    const existingLink = await getDoc(linkRef);
+    if (!activeConsent && !existingLink.exists()) {
+      throw new Error('There is no active attendant link to revoke.');
+    }
+
+    await setDoc(linkRef, {
+      patientUid,
+      attendantUid,
+      activeConsent,
+      ...(activeConsent ? { grantedAt: serverTimestamp() } : {}),
+      updatedAt: serverTimestamp()
+    }, { merge: true });
+  }
+
   public createCase(newCase: EmergencyCase) {
+    this.state.cases = this.state.cases.filter((item) => item.caseId !== newCase.caseId);
     this.state.cases.unshift(newCase);
     this.saveState();
+  }
+
+  public async createEmergencySubmission(
+    emergencyCase: EmergencyCase,
+    requestDrafts: ResourceRequestDraft[],
+    city: string
+  ): Promise<{ requests: ResourceRequest[]; hospitalName: string; alreadySubmitted: boolean }> {
+    if (!isFirebaseConfigured || !db) {
+      throw new Error('Emergency submissions require a configured Firebase project. No data was saved.');
+    }
+    if (!auth.currentUser || auth.currentUser.uid !== emergencyCase.patientUid) {
+      throw new Error('The signed-in patient does not match this emergency case. No data was saved.');
+    }
+
+    const patientSnapshot = await getDoc(doc(db, 'users', auth.currentUser.uid));
+    if (!patientSnapshot.exists() || patientSnapshot.data().role !== 'patient') {
+      throw new Error('Only an authorized patient account can submit an emergency case.');
+    }
+
+    const caseRef = doc(db, 'cases', emergencyCase.caseId);
+    const existingCaseSnapshot = await getDoc(caseRef);
+    if (existingCaseSnapshot.exists()) {
+      const existingCase = existingCaseSnapshot.data() as EmergencyCase;
+      if (
+        existingCase.patientUid !== auth.currentUser.uid ||
+        existingCase.submissionFingerprint !== emergencyCase.submissionFingerprint
+      ) {
+        throw new Error('This emergency submission ID is already in use. Start a new case to submit different details.');
+      }
+
+      const existingRequests = await Promise.all(requestDrafts.map(async (draft) => {
+        const requestId = `REQ-${emergencyCase.caseId}-${draft.resourceType}`;
+        const requestSnapshot = await getDoc(doc(db, 'requests', requestId));
+        if (!requestSnapshot.exists()) {
+          throw new Error('This case was saved but its linked requests could not be verified. Please contact support.');
+        }
+
+        const requestData = requestSnapshot.data();
+        const expectedDetails = draft.resourceType === 'ambulance'
+          ? { ...draft.details, destinationAddress: existingCase.matchedHospitalName }
+          : draft.details;
+        const storedDetails = requestData.details;
+        const detailsMatch = storedDetails &&
+          Object.keys(expectedDetails).length === Object.keys(storedDetails).length &&
+          Object.entries(expectedDetails).every(([key, value]) => storedDetails[key] === value);
+        if (
+          requestData.requestId !== requestId ||
+          requestData.caseId !== emergencyCase.caseId ||
+          requestData.patientUid !== auth.currentUser?.uid ||
+          requestData.requesterUid !== auth.currentUser?.uid ||
+          requestData.resourceType !== draft.resourceType ||
+          typeof requestData.providerUid !== 'string' ||
+          typeof requestData.providerName !== 'string' ||
+          !['pending', 'accepted', 'rejected', 'cancelled', 'completed'].includes(requestData.status) ||
+          !detailsMatch
+        ) {
+          throw new Error('Saved request details do not match this case. Please contact support.');
+        }
+
+        const toIsoString = (value: unknown) => {
+          if (typeof value === 'string' && !Number.isNaN(Date.parse(value))) return value;
+          if (value && typeof value === 'object' && 'toDate' in value && typeof value.toDate === 'function') {
+            const date = value.toDate() as Date;
+            if (!Number.isNaN(date.getTime())) return date.toISOString();
+          }
+          throw new Error('Saved request timestamps could not be verified. Please contact support.');
+        };
+
+        return {
+          ...requestData,
+          createdAt: toIsoString(requestData.createdAt),
+          updatedAt: toIsoString(requestData.updatedAt)
+        } as ResourceRequest;
+      }));
+      const hospitalName = existingCase.matchedHospitalName;
+      if (!hospitalName) {
+        throw new Error('This case was saved but its matched hospital could not be verified. Please contact support.');
+      }
+
+      this.createCase({ ...emergencyCase, matchedHospitalName: hospitalName, requestCount: 0 });
+      existingRequests.forEach((request) => this.createRequest(request));
+      const localCase = this.getCase(emergencyCase.caseId);
+      if (localCase) {
+        localCase.requestCount = existingRequests.length;
+        this.saveState();
+      }
+
+      return { requests: existingRequests, hospitalName, alreadySubmitted: true };
+    }
+
+    const directorySnapshot = await getDocs(collection(db, 'providerDirectory'));
+    const providers = directorySnapshot.docs
+      .map((snapshot) => ({
+        ...snapshot.data(),
+        directoryUid: snapshot.id
+      }) as ProviderDirectoryEntry & { directoryUid: string })
+      .filter((provider) =>
+        provider.uid === provider.directoryUid &&
+        provider.displayName &&
+        PROVIDER_ROLES.includes(provider.role) &&
+        provider.isActive &&
+        provider.isVerified
+      );
+    const normalizedCity = city.trim().toLocaleLowerCase();
+    const byRole = (role: UserRole) =>
+      providers
+        .filter((provider) => provider.role === role)
+        .sort((a, b) => {
+          const aMatchesCity = (a.city || '').trim().toLocaleLowerCase() === normalizedCity;
+          const bMatchesCity = (b.city || '').trim().toLocaleLowerCase() === normalizedCity;
+          return Number(bMatchesCity) - Number(aMatchesCity) || a.uid.localeCompare(b.uid);
+        });
+
+    const hospitalProvider = byRole('hospital')[0];
+    if (!hospitalProvider) {
+      throw new Error('No active, verified hospital is available in the provider directory. No data was saved.');
+    }
+
+    const now = new Date().toISOString();
+    const requests = requestDrafts.map((draft) => {
+      const candidates = byRole(draft.providerRole);
+      const provider = draft.providerRole === 'doctor'
+        ? candidates.find(
+            (candidate) =>
+              candidate.hospitalAffiliation?.trim().toLocaleLowerCase() ===
+              hospitalProvider.displayName.trim().toLocaleLowerCase()
+          )
+        : candidates[0];
+
+      if (!provider) {
+        const roleLabel = draft.providerRole === 'doctor' ? 'doctor affiliated with the matched hospital' : draft.providerRole;
+        throw new Error(`No active, verified ${roleLabel} is available. No data was saved.`);
+      }
+
+      const requestId = `REQ-${emergencyCase.caseId}-${draft.resourceType}`;
+      const requestRef = doc(db, 'requests', requestId);
+      return {
+        ref: requestRef,
+        request: {
+          requestId,
+          caseId: emergencyCase.caseId,
+          patientUid: emergencyCase.patientUid,
+          requesterUid: emergencyCase.patientUid,
+          patientName: emergencyCase.patientName,
+          providerUid: provider.uid,
+          providerName: provider.displayName,
+          resourceType: draft.resourceType,
+          details: draft.resourceType === 'ambulance'
+            ? { ...draft.details, destinationAddress: hospitalProvider.displayName }
+            : draft.details,
+          status: 'pending' as const,
+          createdAt: now,
+          updatedAt: now
+        }
+      };
+    });
+
+    const batch = writeBatch(db);
+    batch.set(caseRef, {
+      ...emergencyCase,
+      matchedHospitalName: hospitalProvider.displayName,
+      attendantConsent: emergencyCase.attendantConsent
+        ? { ...emergencyCase.attendantConsent, grantedAt: serverTimestamp() }
+        : null,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp()
+    });
+    requests.forEach(({ ref, request }) => {
+      batch.set(ref, {
+        ...request,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp()
+      });
+    });
+    await batch.commit();
+
+    this.createCase({
+      ...emergencyCase,
+      matchedHospitalName: hospitalProvider.displayName,
+      requestCount: 0
+    });
+    requests.forEach(({ request }) => this.createRequest(request));
+
+    return {
+      requests: requests.map(({ request }) => request),
+      hospitalName: hospitalProvider.displayName,
+      alreadySubmitted: false
+    };
   }
 
   public updateCaseStatus(caseId: string, status: 'active' | 'resolved' | 'cancelled') {
@@ -646,16 +1173,18 @@ class DataStore {
   }
 
   public createRequest(req: ResourceRequest) {
+    const isNewRequest = !this.state.requests.some((request) => request.requestId === req.requestId);
+    this.state.requests = this.state.requests.filter((request) => request.requestId !== req.requestId);
     this.state.requests.unshift(req);
     // Increment case request count
     const parentCase = this.state.cases.find((c) => c.caseId === req.caseId);
-    if (parentCase) {
+    if (parentCase && isNewRequest) {
       parentCase.requestCount = (parentCase.requestCount || 0) + 1;
       parentCase.updatedAt = new Date().toISOString();
     }
 
     // Notify Provider
-    this.addNotification({
+    if (isNewRequest) this.state.notifications.unshift({
       id: 'notif-' + Date.now(),
       recipientUid: req.providerUid,
       type: 'request_received',
@@ -883,4 +1412,3 @@ class DataStore {
 
 // Global Singleton Instance
 export const dataStore = new DataStore();
-

@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { app, auth, db } from './config/firebase';
 import { AuthProvider, useAuth } from './context/AuthContext';
 import { Header } from './components/common/Header';
@@ -15,7 +15,8 @@ import { OxygenDashboard } from './components/oxygen/OxygenDashboard';
 import { AmbulanceDashboard } from './components/ambulance/AmbulanceDashboard';
 import { DoctorDashboard } from './components/doctor/DoctorDashboard';
 import { AdminDashboard } from './components/admin/AdminDashboard';
-import { dataStore } from './services/dataService';
+import { dataStore, type ResourceRequestDraft } from './services/dataService';
+import type { EmergencyCase as EmergencyCaseRecord } from './types';
 import {
   Heart,
   Activity,
@@ -269,7 +270,7 @@ export interface ResourceStatusItem {
 
 export interface EmergencyCase {
   caseId: string;
-  status: 'Active' | 'Dispatched' | 'Under Review' | 'Completed';
+  status: 'Active' | 'Dispatched' | 'Under Review' | 'Completed' | 'Cancelled';
   createdAt: string;
   dateStr: string;
   patientName: string;
@@ -385,6 +386,7 @@ function CareBridgeApp() {
   const [attendantName, setAttendantName] = useState('Suresh Deshpande');
   const [attendantRelation, setAttendantRelation] = useState('Brother');
   const [attendantPhone, setAttendantPhone] = useState('+91 98451 98765');
+  const [attendantConsentFingerprint, setAttendantConsentFingerprint] = useState<string | null>(null);
   const [incidentAddress, setIncidentAddress] = useState('Plot 42, Vidyanagar Main Road, Hubballi, Karnataka');
   const [triagePriority, setTriagePriority] = useState<'immediate' | 'emergency' | 'urgent' | 'semi-urgent'>('immediate');
   const [emergencyDescription, setEmergencyDescription] = useState(
@@ -393,6 +395,11 @@ function CareBridgeApp() {
 
   // Validation & Submission States - hydrated from localStorage if available
   const [formErrors, setFormErrors] = useState<Record<string, string>>({});
+  const [submissionError, setSubmissionError] = useState<string | null>(null);
+  const [submissionSuccess, setSubmissionSuccess] = useState<string | null>(null);
+  const [isSubmittingCase, setIsSubmittingCase] = useState(false);
+  const submissionLockRef = useRef(false);
+  const submissionKeyRef = useRef<{ fingerprint: string; caseId: string } | null>(null);
   const [submittedCase, setSubmittedCase] = useState<EmergencyCase | null>(() => {
     try {
       const saved = localStorage.getItem('carebridge_active_case');
@@ -488,9 +495,53 @@ function CareBridgeApp() {
   // Dashboard Tab State: 'cases' | 'track' | 'notifications' | 'history' | 'profile'
   const [dashboardTab, setDashboardTab] = useState<'cases' | 'track' | 'notifications' | 'history' | 'profile'>('cases');
   const [selectedDashboardCase, setSelectedDashboardCase] = useState<EmergencyCase | null>(null);
+  const [historyRecords, setHistoryRecords] = useState<EmergencyCaseRecord[]>([]);
+  const [isHistoryLoading, setIsHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState<string | null>(null);
+  const [attendantLinks, setAttendantLinks] = useState<{ attendantUid: string; activeConsent: boolean }[]>([]);
+  const [attendantUidInput, setAttendantUidInput] = useState('');
+  const [savingAttendantUid, setSavingAttendantUid] = useState<string | null>(null);
+  const [historyNotice, setHistoryNotice] = useState<string | null>(null);
+  const [selectedCaseFromHistory, setSelectedCaseFromHistory] = useState(false);
 
   const [copiedCaseId, setCopiedCaseId] = useState(false);
   const [isViewCaseModalOpen, setIsViewCaseModalOpen] = useState(false);
+
+  useEffect(() => {
+    if (dashboardTab !== 'history') return;
+    if (!currentUser || currentUser.role !== 'patient') {
+      setHistoryRecords([]);
+      setIsHistoryLoading(false);
+      setHistoryError('Emergency history is available only to patient accounts.');
+      return;
+    }
+
+    setIsHistoryLoading(true);
+    setHistoryError(null);
+    const unsubscribeHistory = dataStore.subscribeToEmergencyHistory(
+      currentUser.uid,
+      (records) => {
+        setHistoryRecords(records);
+        setIsHistoryLoading(false);
+      },
+      (message) => {
+        setHistoryError(message);
+        setIsHistoryLoading(false);
+      }
+    );
+    const unsubscribeAttendants = dataStore.subscribeToPatientAttendants(
+      currentUser.uid,
+      (links) => {
+        setAttendantLinks(links);
+      },
+      setHistoryError
+    );
+
+    return () => {
+      unsubscribeHistory();
+      unsubscribeAttendants();
+    };
+  }, [dashboardTab, currentUser?.uid, currentUser?.role]);
 
   // Provider Directory Lookup
   const PROVIDERS: Record<string, { name: string; details: string; rating: string; phone: string; address: string }> = {
@@ -517,18 +568,38 @@ function CareBridgeApp() {
     }
   };
 
+  const getAttendantConsentFingerprint = () => JSON.stringify({
+    patientUid: currentUser?.uid,
+    patientName: patientName.trim(),
+    patientAge: patientAge.trim(),
+    patientGender,
+    patientBloodGroup,
+    patientCondition: patientCondition.trim(),
+    attendantName: attendantName.trim(),
+    attendantRelation,
+    attendantPhone: attendantPhone.trim().replace(/[\s().-]/g, ''),
+    incidentAddress: incidentAddress.trim(),
+    emergencyDescription: emergencyDescription.trim(),
+    selectedResources,
+    triagePriority,
+    searchLocation
+  });
+
   // Validate and submit emergency case
-  const handleSubmitCase = (e?: React.FormEvent) => {
+  const handleSubmitCase = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
+    if (submissionLockRef.current) return;
+    setSubmissionError(null);
+    setSubmissionSuccess(null);
     const errors: Record<string, string> = {};
 
     if (!patientName.trim()) {
       errors.patientName = 'Patient full name is required';
     }
-    if (!patientAge.trim() || isNaN(Number(patientAge)) || Number(patientAge) <= 0 || Number(patientAge) > 125) {
+    if (!patientAge.trim() || !Number.isInteger(Number(patientAge)) || Number(patientAge) <= 0 || Number(patientAge) > 125) {
       errors.patientAge = 'Please enter a valid patient age (1–125)';
     }
-    if (!patientGender) {
+    if (!patientGender.trim()) {
       errors.patientGender = 'Gender is required';
     }
     if (!patientCondition.trim()) {
@@ -537,8 +608,18 @@ function CareBridgeApp() {
     if (!attendantName.trim()) {
       errors.attendantName = 'Attendant full name is required';
     }
-    if (!attendantPhone.trim() || attendantPhone.trim().length < 8) {
+    const normalizedAttendantPhone = attendantPhone.trim().replace(/[\s().-]/g, '');
+    if (!/^\+?[1-9]\d{7,14}$/.test(normalizedAttendantPhone)) {
       errors.attendantPhone = 'Please enter a valid contact phone number';
+    }
+    if (!attendantRelation.trim()) {
+      errors.attendantRelation = 'Please select the attendant relationship';
+    }
+    if (
+      attendantRelation !== 'Self' &&
+      attendantConsentFingerprint !== getAttendantConsentFingerprint()
+    ) {
+      errors.attendantConsent = 'Confirm that the patient has consented to this submission';
     }
     if (!incidentAddress.trim()) {
       errors.incidentAddress = 'Incident address / landmark is required';
@@ -570,198 +651,243 @@ function CareBridgeApp() {
       return;
     }
 
+    if (!currentUser || currentUser.role !== 'patient') {
+      setSubmissionError('Sign in with an authorized patient account to submit an emergency case.');
+      return;
+    }
+
     setFormErrors({});
+    setSubmissionError(null);
+    submissionLockRef.current = true;
+    setIsSubmittingCase(true);
 
-    const randomSuffix = Math.floor(1000 + Math.random() * 9000);
-    const newCaseId = `CB-2026-${randomSuffix}`;
-    const nowTime = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    const nowDateStr = new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+    try {
+      const requestCity = searchLocation.split(',')[0].trim() || currentUser.city;
+      const submissionFingerprint = getAttendantConsentFingerprint();
+      if (submissionKeyRef.current?.fingerprint !== submissionFingerprint) {
+        try {
+          const savedKey = sessionStorage.getItem('carebridge_emergency_submission_key');
+          const parsedKey = savedKey ? JSON.parse(savedKey) as { fingerprint?: string; caseId?: string } : null;
+          if (parsedKey?.fingerprint === submissionFingerprint && parsedKey.caseId) {
+            submissionKeyRef.current = { fingerprint: parsedKey.fingerprint, caseId: parsedKey.caseId };
+          }
+        } catch (storageError) {
+          console.warn('Could not restore emergency submission key:', storageError);
+        }
+        if (submissionKeyRef.current?.fingerprint !== submissionFingerprint) {
+          const randomSuffix = Math.floor(1000 + Math.random() * 9000);
+          submissionKeyRef.current = {
+            fingerprint: submissionFingerprint,
+            caseId: `CB-${Date.now()}-${randomSuffix}`
+          };
+          try {
+            sessionStorage.setItem(
+              'carebridge_emergency_submission_key',
+              JSON.stringify(submissionKeyRef.current)
+            );
+          } catch (storageError) {
+            console.warn('Could not persist emergency submission key:', storageError);
+          }
+        }
+      }
+      const newCaseId = submissionKeyRef.current.caseId;
+      const now = new Date();
+      const nowTime = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      const nowDateStr = now.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+      const currentProvider = PROVIDERS[selectedProviderId] || PROVIDERS['prov-01'];
 
-    const currentProvider = PROVIDERS[selectedProviderId] || PROVIDERS['prov-01'];
+      const individualStatuses = activeResources.map((res) => {
+        if (res === 'Hospital Beds') {
+          return {
+            resource: 'Hospital Beds',
+            status: 'Pending Bed Allocation',
+            code: 'pending' as const,
+            detail: 'Emergency room notified • Inpatient triage bed reservation initiated',
+            updatedAt: 'Just now'
+          };
+        }
+        if (res === 'ICU Facilities') {
+          return {
+            resource: 'ICU Facilities',
+            status: 'Under Clinical Review',
+            code: 'in-review' as const,
+            detail: 'ICU Intensivist reviewing triage notes & vital stability',
+            updatedAt: 'Just now'
+          };
+        }
+        if (res === 'Blood') {
+          return {
+            resource: 'Blood Units',
+            status: 'Cross-Match Requested',
+            code: 'in-review' as const,
+            detail: `Requisition sent for ${patientBloodGroup || 'B+'} blood units`,
+            updatedAt: 'Just now'
+          };
+        }
+        if (res === 'Oxygen') {
+          return {
+            resource: 'Oxygen Supply',
+            status: 'Reserved & Staged',
+            code: 'reserved' as const,
+            detail: 'High-flow oxygen regulator allocated for patient intake',
+            updatedAt: 'Just now'
+          };
+        }
+        return {
+          resource: 'Ambulance Services',
+          status: 'Dispatched • En Route',
+          code: 'dispatched' as const,
+          detail: 'Ambulance request sent to an active provider',
+          updatedAt: 'Just now'
+        };
+      });
 
-    // Construct individual request statuses for each selected resource
-    const individualStatuses = activeResources.map((res) => {
-      if (res === 'Hospital Beds') {
-        return {
-          resource: 'Hospital Beds',
-          status: 'Pending Bed Allocation',
-          code: 'pending' as const,
-          detail: 'Emergency room notified • Inpatient triage bed reservation initiated',
-          updatedAt: 'Just now'
-        };
-      }
-      if (res === 'ICU Facilities') {
-        return {
-          resource: 'ICU Facilities',
-          status: 'Under Clinical Review',
-          code: 'in-review' as const,
-          detail: 'ICU Intensivist reviewing triage notes & vital stability',
-          updatedAt: 'Just now'
-        };
-      }
-      if (res === 'Blood') {
-        return {
-          resource: 'Blood Units',
-          status: 'Cross-Match Requested',
-          code: 'in-review' as const,
-          detail: `Requisition sent for ${patientBloodGroup || 'B+'} blood units`,
-          updatedAt: 'Just now'
-        };
-      }
-      if (res === 'Oxygen') {
-        return {
-          resource: 'Oxygen Supply',
-          status: 'Reserved & Staged',
-          code: 'reserved' as const,
-          detail: 'High-flow oxygen regulator allocated for patient intake',
-          updatedAt: 'Just now'
-        };
-      }
-      // Ambulance
-      return {
-        resource: 'Ambulance Services',
-        status: 'Dispatched • En Route',
-        code: 'dispatched' as const,
-        detail: 'Unit AMB-04 paramedic vehicle dispatched • Estimated ETA: 8 minutes',
+      individualStatuses.push({
+        resource: 'Doctor Consultation',
+        status: 'Awaiting Physician Review',
+        code: 'in-review',
+        detail: 'Request sent to an active doctor affiliated with the matched hospital',
         updatedAt: 'Just now'
-      };
-    });
+      });
 
-    const newCaseData: EmergencyCase = {
-      caseId: newCaseId,
-      status: 'Active',
-      createdAt: nowTime,
-      dateStr: nowDateStr,
-      patientName: patientName.trim(),
-      patientAge: patientAge.trim(),
-      patientGender,
-      patientBloodGroup,
-      patientCondition: patientCondition.trim(),
-      attendantName: attendantName.trim(),
-      attendantRelation,
-      attendantPhone: attendantPhone.trim(),
-      incidentAddress: incidentAddress.trim(),
-      triagePriority,
-      emergencyDescription: emergencyDescription.trim(),
-      providerName: currentProvider.name,
-      providerDetails: currentProvider.details,
-      providerRating: currentProvider.rating,
-      resourcesList: activeResources,
-      individualStatuses
-    };
-
-    setSubmittedCase(newCaseData);
-    setCasesList((prev) => {
-      const updated = [newCaseData, ...prev.filter((c) => c.caseId !== newCaseData.caseId)];
-      try {
-        localStorage.setItem('carebridge_cases_list', JSON.stringify(updated));
-      } catch (e) {}
-      return updated;
-    });
-    try {
-      localStorage.setItem('carebridge_active_case', JSON.stringify(newCaseData));
-    } catch (e) {}
-
-    // Synchronize with unified CareBridge DataStore
-    try {
-      dataStore.createCase({
+      const newCaseData: EmergencyCase = {
         caseId: newCaseId,
-        patientUid: currentUser?.uid || 'patient-demo-01',
+        status: 'Active',
+        createdAt: nowTime,
+        dateStr: nowDateStr,
         patientName: patientName.trim(),
-        patientAge: Number(patientAge.trim()) || 40,
+        patientAge: patientAge.trim(),
+        patientGender,
+        patientBloodGroup,
+        patientCondition: patientCondition.trim(),
+        attendantName: attendantName.trim(),
+        attendantRelation,
+        attendantPhone: normalizedAttendantPhone,
+        incidentAddress: incidentAddress.trim(),
+        triagePriority,
+        emergencyDescription: emergencyDescription.trim(),
+        providerName: currentProvider.name,
+        providerDetails: currentProvider.details,
+        providerRating: currentProvider.rating,
+        resourcesList: [...activeResources, 'Doctor Consultation'],
+        individualStatuses
+      };
+
+      const requestDrafts: ResourceRequestDraft[] = [];
+      if (selectedResources.beds) {
+        requestDrafts.push({
+          resourceType: 'bed',
+          providerRole: 'hospital',
+          details: { bedType: 'General Emergency Bed', notes: emergencyDescription.trim() }
+        });
+      }
+      if (selectedResources.icu) {
+        requestDrafts.push({
+          resourceType: 'icu',
+          providerRole: 'hospital',
+          details: { bedType: 'ICU Bed', notes: emergencyDescription.trim() }
+        });
+      }
+      if (selectedResources.blood) {
+        requestDrafts.push({
+          resourceType: 'blood',
+          providerRole: 'bloodBank',
+          details: { bloodGroup: patientBloodGroup, units: 2, notes: 'Emergency transfusion requirement' }
+        });
+      }
+      if (selectedResources.oxygen) {
+        requestDrafts.push({
+          resourceType: 'oxygen',
+          providerRole: 'oxygenProvider',
+          details: { cylinders: 2, concentrators: 0, notes: 'High-flow oxygen support' }
+        });
+      }
+      if (selectedResources.ambulance) {
+        requestDrafts.push({
+          resourceType: 'ambulance',
+          providerRole: 'ambulanceProvider',
+          details: {
+            vehicleType: 'ALS Cardiac Ambulance',
+            pickupAddress: incidentAddress.trim()
+          }
+        });
+      }
+      requestDrafts.push({
+        resourceType: 'doctor',
+        providerRole: 'doctor',
+        details: { notes: emergencyDescription.trim() }
+      });
+
+      const emergencyCase: EmergencyCaseRecord = {
+        caseId: newCaseId,
+        submissionFingerprint,
+        patientUid: currentUser.uid,
+        patientName: patientName.trim(),
+        patientAge: Number(patientAge.trim()),
         patientGender,
         conditionSummary: patientCondition.trim(),
         urgencyLevel: triagePriority,
-        resourcesNeeded: activeResources,
+        resourcesNeeded: [...requestDrafts.map((request) => request.resourceType)],
         location: {
-          city: 'Hubballi',
+          city: requestCity,
           address: incidentAddress.trim(),
-          state: 'Karnataka'
+          state: currentUser.state
         },
         attendant: {
           name: attendantName.trim(),
           relation: attendantRelation,
-          phone: attendantPhone.trim()
+          phone: normalizedAttendantPhone
         },
+        ...(attendantRelation !== 'Self' && {
+          attendantConsent: {
+            granted: true,
+            givenByUid: currentUser.uid,
+            grantedAt: now.toISOString()
+          }
+        }),
         status: 'active',
-        requestCount: activeResources.length,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString()
+        requestCount: requestDrafts.length,
+        createdAt: now.toISOString(),
+        updatedAt: now.toISOString()
+      };
+
+      const { hospitalName, alreadySubmitted } = await dataStore.createEmergencySubmission(
+        emergencyCase,
+        requestDrafts,
+        requestCity
+      );
+      newCaseData.providerName = hospitalName;
+      newCaseData.providerDetails = 'Emergency provider matched from the active directory';
+      newCaseData.providerRating = 'Verified provider';
+
+      setSubmissionSuccess(
+        alreadySubmitted
+          ? 'This emergency case was already saved. No duplicate was created.'
+          : 'Emergency case submitted successfully.'
+      );
+      setSubmittedCase(newCaseData);
+      setCasesList((prev) => {
+        const updated = [newCaseData, ...prev.filter((c) => c.caseId !== newCaseData.caseId)];
+        try {
+          localStorage.setItem('carebridge_cases_list', JSON.stringify(updated));
+        } catch (storageError) {
+          console.warn('Could not cache submitted case locally:', storageError);
+        }
+        return updated;
       });
-
-      if (selectedResources.beds || selectedResources.icu) {
-        dataStore.createRequest({
-          requestId: 'REQ-' + Date.now().toString().slice(-6) + '-1',
-          caseId: newCaseId,
-          patientUid: currentUser?.uid || 'patient-demo-01',
-          patientName: patientName.trim(),
-          providerUid: 'hosp-demo-01',
-          providerName: currentProvider.name || 'KIMS Super Specialty Hospital',
-          resourceType: 'bed',
-          details: { bedType: selectedResources.icu ? 'ICU Bed' : 'General Emergency Bed', notes: emergencyDescription },
-          status: 'pending',
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString()
-        });
+      try {
+        localStorage.setItem('carebridge_active_case', JSON.stringify(newCaseData));
+      } catch (storageError) {
+        console.warn('Could not cache active case locally:', storageError);
       }
-
-      if (selectedResources.blood) {
-        dataStore.createRequest({
-          requestId: 'REQ-' + Date.now().toString().slice(-6) + '-2',
-          caseId: newCaseId,
-          patientUid: currentUser?.uid || 'patient-demo-01',
-          patientName: patientName.trim(),
-          providerUid: 'blood-demo-01',
-          providerName: 'Red Cross Regional Blood Centre',
-          resourceType: 'blood',
-          details: { bloodGroup: patientBloodGroup, units: 2, notes: 'Emergency transfusion requirement' },
-          status: 'pending',
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString()
-        });
-      }
-
-      if (selectedResources.oxygen) {
-        dataStore.createRequest({
-          requestId: 'REQ-' + Date.now().toString().slice(-6) + '-3',
-          caseId: newCaseId,
-          patientUid: currentUser?.uid || 'patient-demo-01',
-          patientName: patientName.trim(),
-          providerUid: 'oxy-demo-01',
-          providerName: 'OxyLife Medical Gas Distributors',
-          resourceType: 'oxygen',
-          details: { cylinders: 2, concentrators: 0, notes: 'High-flow oxygen support' },
-          status: 'pending',
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString()
-        });
-      }
-
-      if (selectedResources.ambulance) {
-        dataStore.createRequest({
-          requestId: 'REQ-' + Date.now().toString().slice(-6) + '-4',
-          caseId: newCaseId,
-          patientUid: currentUser?.uid || 'patient-demo-01',
-          patientName: patientName.trim(),
-          providerUid: 'amb-demo-01',
-          providerName: 'SwiftCare Emergency Ambulance Fleet',
-          resourceType: 'ambulance',
-          details: {
-            vehicleType: 'ALS Cardiac Ambulance',
-            pickupAddress: incidentAddress.trim(),
-            destinationAddress: currentProvider.name || 'KIMS Super Specialty Hospital'
-          },
-          status: 'pending',
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString()
-        });
-      }
+      setCurrentScreen('case-confirmation');
     } catch (err) {
-      console.warn('DataStore sync note:', err);
+      console.error('[CareBridge App] Emergency submission failed:', err);
+      setSubmissionError(err instanceof Error ? err.message : 'Emergency case could not be saved. Please try again.');
+    } finally {
+      submissionLockRef.current = false;
+      setIsSubmittingCase(false);
     }
-
-    // Navigate to Emergency Case Confirmation Screen (Screen D)
-    setCurrentScreen('case-confirmation');
   };
 
   const copyCaseId = (id: string) => {
@@ -779,9 +905,18 @@ function CareBridgeApp() {
     setAttendantName('');
     setAttendantRelation('Self');
     setAttendantPhone('');
+    setAttendantConsentFingerprint(null);
     setEmergencyDescription('');
     setIncidentAddress(searchLocation || 'Hubballi, Karnataka');
     setFormErrors({});
+    setSubmissionError(null);
+    setSubmissionSuccess(null);
+    submissionKeyRef.current = null;
+    try {
+      sessionStorage.removeItem('carebridge_emergency_submission_key');
+    } catch (storageError) {
+      console.warn('Could not clear emergency submission key:', storageError);
+    }
   };
 
   const handleReturnToDashboard = () => {
@@ -804,6 +939,62 @@ function CareBridgeApp() {
     if (selectedDashboardCase?.caseId === caseId) {
       setSelectedDashboardCase((prev) => (prev ? { ...prev, status: 'Completed' } : null));
     }
+  };
+
+  const handleAttendantConsent = async (attendantUid: string, activeConsent: boolean) => {
+    if (!currentUser || currentUser.role !== 'patient') return;
+    setSavingAttendantUid(attendantUid);
+    setHistoryError(null);
+    setHistoryNotice(null);
+    try {
+      await dataStore.setPatientAttendantConsent(currentUser.uid, attendantUid, activeConsent);
+      if (activeConsent) setAttendantUidInput('');
+      setHistoryNotice(activeConsent ? 'Attendant linked with active consent.' : 'Attendant access revoked.');
+    } catch (error) {
+      setHistoryError(error instanceof Error ? error.message : 'Could not update attendant consent.');
+    } finally {
+      setSavingAttendantUid(null);
+    }
+  };
+
+  const openHistoryDetails = (record: EmergencyCaseRecord) => {
+    const createdAt = new Date(record.createdAt);
+    const status = record.status === 'resolved'
+      ? 'Completed'
+      : record.status === 'cancelled'
+        ? 'Cancelled'
+        : 'Active';
+    const resourceNames: Record<string, string> = {
+      bed: 'Hospital Bed',
+      icu: 'ICU',
+      blood: 'Blood',
+      oxygen: 'Oxygen',
+      ambulance: 'Ambulance',
+      doctor: 'Doctor'
+    };
+    setSelectedDashboardCase({
+      caseId: record.caseId,
+      status,
+      createdAt: createdAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      dateStr: createdAt.toLocaleDateString(),
+      patientName: record.patientName,
+      patientAge: String(record.patientAge),
+      patientGender: record.patientGender,
+      patientBloodGroup: 'Not provided',
+      patientCondition: record.conditionSummary,
+      attendantName: record.attendant?.name || 'Not provided',
+      attendantRelation: record.attendant?.relation || 'Not provided',
+      attendantPhone: record.attendant?.phone || 'Not provided',
+      incidentAddress: record.location?.address || 'Not provided',
+      triagePriority: record.urgencyLevel,
+      emergencyDescription: record.conditionSummary,
+      providerName: record.matchedHospitalName || 'Not assigned',
+      providerDetails: 'Emergency case record',
+      providerRating: 'Verified provider',
+      resourcesList: (record.resourcesNeeded || []).map((resource) => resourceNames[resource] || resource),
+      individualStatuses: []
+    });
+    setSelectedCaseFromHistory(true);
   };
 
   return (
@@ -1387,7 +1578,10 @@ function CareBridgeApp() {
                         </label>
                         <select
                           value={attendantRelation}
-                          onChange={(e) => setAttendantRelation(e.target.value)}
+                          onChange={(e) => {
+                            setAttendantRelation(e.target.value);
+                            setFormErrors((prev) => ({ ...prev, attendantRelation: '', attendantConsent: '' }));
+                          }}
                           className="w-full px-3 py-2 text-sm bg-white border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#00707E] font-medium text-slate-900"
                         >
                           <option value="Parent">Parent</option>
@@ -1399,6 +1593,11 @@ function CareBridgeApp() {
                           <option value="Self">Self (Patient)</option>
                           <option value="Other">Other</option>
                         </select>
+                        {formErrors.attendantRelation && (
+                          <p className="text-xs text-red-600 mt-1 flex items-center gap-1">
+                            <AlertCircle className="h-3 w-3" /> {formErrors.attendantRelation}
+                          </p>
+                        )}
                       </div>
 
                       {/* Phone Number */}
@@ -1425,6 +1624,33 @@ function CareBridgeApp() {
                         )}
                       </div>
                     </div>
+                    {attendantRelation !== 'Self' && (
+                      <div className="mt-3">
+                        <label className="flex items-start gap-2 text-xs text-slate-700">
+                          <input
+                            type="checkbox"
+                            checked={attendantConsentFingerprint === getAttendantConsentFingerprint()}
+                            onChange={(e) => {
+                              setAttendantConsentFingerprint(
+                                e.target.checked ? getAttendantConsentFingerprint() : null
+                              );
+                              if (e.target.checked) {
+                                setFormErrors((prev) => ({ ...prev, attendantConsent: '' }));
+                              }
+                            }}
+                            className="mt-0.5 accent-[#00707E]"
+                          />
+                          <span>
+                            I confirm the patient has consented to sharing these details and requesting emergency resources.
+                          </span>
+                        </label>
+                        {formErrors.attendantConsent && (
+                          <p className="text-xs text-red-600 mt-1 flex items-center gap-1">
+                            <AlertCircle className="h-3 w-3" /> {formErrors.attendantConsent}
+                          </p>
+                        )}
+                      </div>
+                    )}
                   </div>
 
                   {/* SECTION 3: INCIDENT LOCATION */}
@@ -1695,14 +1921,22 @@ function CareBridgeApp() {
                     </div>
                   )}
 
+                  {submissionError && (
+                    <div role="alert" className="p-3 bg-red-50 border border-red-200 rounded-xl flex items-start gap-2">
+                      <AlertTriangle className="h-4 w-4 text-red-600 shrink-0 mt-0.5" />
+                      <p className="text-xs text-red-700 font-medium leading-relaxed">{submissionError}</p>
+                    </div>
+                  )}
+
                   {/* Primary Submit Button */}
                   <button
                     type="button"
-                    onClick={() => handleSubmitCase()}
-                    className="w-full py-3.5 px-6 rounded-xl bg-[#00707E] hover:bg-[#005B66] text-white font-bold text-sm sm:text-base shadow-md transition-all active:scale-[0.99] flex items-center justify-center gap-2"
+                    onClick={() => void handleSubmitCase()}
+                    disabled={isSubmittingCase}
+                    className="w-full py-3.5 px-6 rounded-xl bg-[#00707E] hover:bg-[#005B66] disabled:opacity-60 disabled:cursor-wait text-white font-bold text-sm sm:text-base shadow-md transition-all active:scale-[0.99] flex items-center justify-center gap-2"
                   >
-                    <span>Submit Emergency Case</span>
-                    <ArrowRight className="h-4 w-4" />
+                    <span>{isSubmittingCase ? 'Saving Emergency Case…' : 'Submit Emergency Case'}</span>
+                    {!isSubmittingCase && <ArrowRight className="h-4 w-4" />}
                   </button>
 
                   {/* Secondary Back Button */}
@@ -1829,6 +2063,12 @@ function CareBridgeApp() {
             <div className="flex-1 relative p-4 sm:p-6 lg:p-8 flex flex-col justify-between">
               {/* Background Blue Band across Middle */}
               <div className="absolute inset-x-0 top-16 bottom-16 bg-[#0F4C81] z-0 pointer-events-none"></div>
+              {submissionSuccess && (
+                <div role="status" className="relative z-10 w-full max-w-6xl mx-auto mb-4 p-3 bg-emerald-50 border border-emerald-200 text-emerald-800 text-sm font-semibold rounded-xl flex items-center gap-2">
+                  <CheckCircle2 className="h-4 w-4 text-emerald-600" />
+                  {submissionSuccess}
+                </div>
+              )}
 
               {/* Foreground Two Panels Grid: strictly side-by-side on desktop (md:grid-cols-2) */}
               <div className="relative z-10 w-full max-w-6xl mx-auto grid grid-cols-1 md:grid-cols-2 gap-6 lg:gap-8 items-stretch my-auto">
@@ -2178,7 +2418,7 @@ function CareBridgeApp() {
         ) : (() => {
         // Dynamic dashboard calculations from available casesList
         const totalCasesCount = casesList.length;
-        const activeCasesCount = casesList.filter((c) => c.status !== 'Completed').length;
+        const activeCasesCount = casesList.filter((c) => c.status !== 'Completed' && c.status !== 'Cancelled').length;
         const completedCasesCount = casesList.filter((c) => c.status === 'Completed').length;
         const pendingResourceCount = casesList.reduce((acc, c) => {
           const pendingInCase = c.individualStatuses?.filter(
@@ -2188,7 +2428,7 @@ function CareBridgeApp() {
         }, 0);
 
         // Active case to highlight in Resource Request Summary (either first active case or submittedCase)
-        const primaryActiveCase = casesList.find((c) => c.status !== 'Completed') || casesList[0] || null;
+        const primaryActiveCase = casesList.find((c) => c.status !== 'Completed' && c.status !== 'Cancelled') || casesList[0] || null;
 
         // Triage badge helper
         const getTriageBadge = (priority: string) => {
@@ -2575,7 +2815,10 @@ function CareBridgeApp() {
 
                               <button
                                 type="button"
-                                onClick={() => setSelectedDashboardCase(c)}
+                                onClick={() => {
+                                  setSelectedCaseFromHistory(false);
+                                  setSelectedDashboardCase(c);
+                                }}
                                 className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-[#00707E] hover:text-white text-slate-800 text-xs font-bold transition-all"
                               >
                                 <Eye className="h-3.5 w-3.5" />
@@ -2617,7 +2860,10 @@ function CareBridgeApp() {
                           </div>
                           <button
                             type="button"
-                            onClick={() => setSelectedDashboardCase(primaryActiveCase)}
+                            onClick={() => {
+                              setSelectedCaseFromHistory(false);
+                              setSelectedDashboardCase(primaryActiveCase);
+                            }}
                             className="text-xs font-semibold text-[#00707E] hover:underline"
                           >
                             Details →
@@ -2904,10 +3150,10 @@ function CareBridgeApp() {
                     <div>
                       <h2 className="text-xl font-bold text-slate-900 flex items-center gap-2">
                         <History className="h-5 w-5 text-[#00707E]" />
-                        <span>Emergency History & Archive</span>
+                        <span>Emergency History</span>
                       </h2>
                       <p className="text-xs text-slate-500 mt-0.5">
-                        Archived medical intake logs and past resolved emergency admissions
+                        Live emergency records available to you
                       </p>
                     </div>
                     <button
@@ -2919,17 +3165,123 @@ function CareBridgeApp() {
                     </button>
                   </div>
 
-                  <div className="p-4 rounded-xl border border-slate-200 bg-slate-50 space-y-2">
-                    <div className="flex items-center justify-between">
-                      <span className="font-mono text-xs font-bold text-slate-800">CB-2026-HIST-01</span>
-                      <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-slate-200 text-slate-700">
-                        Archived • March 2026
-                      </span>
+                  {currentUser?.role === 'patient' && (
+                    <section className="rounded-xl border border-teal-200 bg-teal-50/60 p-4 space-y-3">
+                      <div>
+                        <h3 className="text-sm font-bold text-slate-900">Patient attendant access</h3>
+                        <p className="text-xs text-slate-600 mt-1">
+                          Share your account UID with an attendant. Add their registered UID to grant access to your emergency history; you can revoke it at any time.
+                        </p>
+                        <p className="mt-2 text-xs text-slate-700">
+                          Your CareBridge UID: <span className="font-mono font-semibold select-all">{currentUser.uid}</span>
+                        </p>
+                      </div>
+                      <form
+                        className="flex flex-col sm:flex-row gap-2"
+                        onSubmit={(event) => {
+                          event.preventDefault();
+                          const uid = attendantUidInput.trim();
+                          if (uid) void handleAttendantConsent(uid, true);
+                        }}
+                      >
+                        <input
+                          type="text"
+                          value={attendantUidInput}
+                          onChange={(event) => setAttendantUidInput(event.target.value)}
+                          placeholder="Attendant’s registered account UID"
+                          aria-label="Attendant's CareBridge account UID"
+                          className="min-w-0 flex-1 rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs focus:outline-none focus:ring-2 focus:ring-teal-500"
+                        />
+                        <button
+                          type="submit"
+                          disabled={!attendantUidInput.trim() || savingAttendantUid !== null}
+                          className="rounded-lg bg-[#00707E] px-4 py-2 text-xs font-bold text-white disabled:opacity-50"
+                        >
+                          {savingAttendantUid === attendantUidInput.trim() ? 'Saving…' : 'Grant access'}
+                        </button>
+                      </form>
+                      {attendantLinks.length > 0 && (
+                        <div className="space-y-2">
+                          {attendantLinks.map((link) => (
+                            <div key={link.attendantUid} className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2">
+                              <div>
+                                <span className="font-mono text-xs font-semibold text-slate-800">{link.attendantUid}</span>
+                                <span className={`ml-2 text-[10px] font-bold ${link.activeConsent ? 'text-emerald-700' : 'text-slate-500'}`}>
+                                  {link.activeConsent ? 'Active consent' : 'Revoked'}
+                                </span>
+                              </div>
+                              <button
+                                type="button"
+                                disabled={savingAttendantUid !== null}
+                                onClick={() => void handleAttendantConsent(link.attendantUid, !link.activeConsent)}
+                                className="text-xs font-bold text-[#00707E] hover:underline disabled:opacity-50"
+                              >
+                                {link.activeConsent ? 'Revoke access' : 'Restore access'}
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </section>
+                  )}
+
+                  {historyNotice && (
+                    <div role="status" className="rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-xs font-medium text-emerald-800">
+                      {historyNotice}
                     </div>
-                    <p className="text-xs text-slate-700">
-                      Patient: Smt. Sunita Patil • Trauma & Fracture Intake • Successfully resolved at City General Hospital.
-                    </p>
-                  </div>
+                  )}
+                  {historyError && (
+                    <div role="alert" className="rounded-lg border border-red-200 bg-red-50 p-3 text-xs font-medium text-red-800">
+                      {historyError}
+                    </div>
+                  )}
+                  {isHistoryLoading ? (
+                    <div role="status" className="py-10 text-center text-sm text-slate-500">
+                      <span className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-slate-300 border-t-[#00707E] align-[-3px] mr-2" />
+                      Loading emergency history…
+                    </div>
+                  ) : historyRecords.length === 0 ? (
+                    historyError ? null : (
+                      <div className="rounded-xl border border-dashed border-slate-300 bg-slate-50 px-4 py-10 text-center">
+                        <History className="mx-auto h-8 w-8 text-slate-400" />
+                        <p className="mt-2 text-sm font-semibold text-slate-700">No emergency records found</p>
+                        <p className="mt-1 text-xs text-slate-500">
+                          Your own cases and cases shared with you using active consent will appear here.
+                        </p>
+                      </div>
+                    )
+                  ) : (
+                    <div className="space-y-3">
+                      {historyRecords.map((record) => (
+                        <article key={record.caseId} className="rounded-xl border border-slate-200 bg-white p-4">
+                          <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3">
+                            <div className="space-y-1.5">
+                              <p className="font-mono text-xs font-bold text-slate-900">{record.caseId}</p>
+                              <p className="text-sm font-semibold text-slate-800">
+                                Category: {record.conditionSummary || 'Emergency case'}
+                              </p>
+                              <p className="text-xs text-slate-600">
+                                Priority: <span className="font-semibold capitalize">{record.urgencyLevel}</span>
+                                <span className="mx-2 text-slate-300">•</span>
+                                {new Date(record.createdAt).toLocaleString()}
+                              </p>
+                              <p className="text-xs text-slate-600">
+                                Status: <span className="font-semibold capitalize">{record.status}</span>
+                              </p>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => openHistoryDetails(record)}
+                              className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-teal-200 bg-teal-50 px-3 py-2 text-xs font-bold text-[#00707E] hover:bg-teal-100"
+                            >
+                              <Eye className="h-3.5 w-3.5" />
+                              Open details
+                            </button>
+                          </div>
+                        </article>
+                      ))}
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -3012,7 +3364,10 @@ function CareBridgeApp() {
                     </div>
                     <button
                       type="button"
-                      onClick={() => setSelectedDashboardCase(null)}
+                      onClick={() => {
+                        setSelectedCaseFromHistory(false);
+                        setSelectedDashboardCase(null);
+                      }}
                       className="text-slate-400 hover:text-slate-700 p-1.5 rounded-lg hover:bg-slate-100 transition-colors"
                     >
                       ✕
@@ -3096,7 +3451,9 @@ function CareBridgeApp() {
 
                   {/* Action Buttons */}
                   <div className="space-y-2 pt-2 border-t border-slate-100">
-                    {selectedDashboardCase.status !== 'Completed' && (
+                    {!selectedCaseFromHistory &&
+                      selectedDashboardCase.status !== 'Completed' &&
+                      selectedDashboardCase.status !== 'Cancelled' && (
                       <button
                         type="button"
                         onClick={() => handleMarkCaseCompleted(selectedDashboardCase.caseId)}
@@ -3119,7 +3476,10 @@ function CareBridgeApp() {
 
                       <button
                         type="button"
-                        onClick={() => setSelectedDashboardCase(null)}
+                        onClick={() => {
+                          setSelectedCaseFromHistory(false);
+                          setSelectedDashboardCase(null);
+                        }}
                         className="flex-1 py-2 px-3 rounded-xl bg-[#00707E] hover:bg-[#005B66] text-white font-semibold text-xs transition-colors shadow-xs"
                       >
                         Close
@@ -3147,4 +3507,3 @@ export default function App() {
     </AuthProvider>
   );
 }
-
