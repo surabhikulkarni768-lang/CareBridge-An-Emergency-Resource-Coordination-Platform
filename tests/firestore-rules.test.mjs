@@ -130,7 +130,7 @@ const patientCase = {
 };
 
 const patient = await createAccount('patient', 'patient');
-const attendant = await createAccount('attendant', 'patient');
+const attendant = await createAccount('attendant', 'patientAttendant');
 const stranger = await createAccount('stranger', 'patient');
 const assignedProvider = await createAccount('assigned-provider', 'bloodBank');
 const unassignedProvider = await createAccount('unassigned-provider', 'bloodBank');
@@ -151,7 +151,7 @@ await seed(`providerDirectory/${unassignedProvider.uid}`, {
   isActive: true,
   isVerified: true
 });
-const caseDocument = { ...patientCase, patientUid: patient.uid };
+const caseDocument = { ...patientCase, patientUid: patient.uid, requesterUid: patient.uid };
 const requestDocument = {
   requestId: `REQ-${caseId}-blood`,
   caseId,

@@ -1,0 +1,5 @@
+{
+  "name": "CareBridge",
+  "description": "Emergency Healthcare Resource Coordination Platform connecting patients, hospitals, blood banks, oxygen providers, and ambulances.",
+  "capabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

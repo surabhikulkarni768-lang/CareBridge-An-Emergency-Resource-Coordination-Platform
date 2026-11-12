@@ -151,7 +151,7 @@ export const DoctorDashboard: React.FC = () => {
                   <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-500 mt-1">
                     <span>Age: <strong>{selectedCase.patientAge}</strong></span>
                     <span>Gender: <strong>{selectedCase.patientGender}</strong></span>
-                    <span>Incident: <strong>{selectedCase.location.address}</strong></span>
+                    <span>Incident: <strong>{selectedCase.location?.address || selectedCase.incidentAddress || 'Not provided'}</strong></span>
                   </div>
                 </div>
                 <span className="font-mono text-xs font-bold bg-slate-100 text-slate-800 px-2.5 py-1 rounded-lg">
@@ -272,4 +272,3 @@ export const DoctorDashboard: React.FC = () => {
     </div>
   );
 };
-

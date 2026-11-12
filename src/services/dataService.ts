@@ -20,6 +20,8 @@ import {
   onSnapshot,
   query,
   where,
+  orderBy,
+  deleteDoc,
   serverTimestamp,
   type Unsubscribe
 } from 'firebase/firestore';
@@ -36,7 +38,10 @@ import type {
   UserProfile,
   UserRole,
   ClinicalNote,
-  AmbulanceTripStatus
+  AmbulanceTripStatus,
+  PatientLink,
+  CaseStatus,
+  EmergencyServiceStatus
 } from '../types';
 
 export interface ResourceRequestDraft {
@@ -75,6 +80,21 @@ const firestoreDateToIso = (value: unknown): string => {
 // ==========================================
 
 export const DEMO_USERS: UserProfile[] = [
+  {
+    uid: 'attendant-sahana-01',
+    email: 'sahana2006@gmail.com',
+    displayName: 'Sahana S.',
+    role: 'patientAttendant',
+    phone: '+91 98451 98765',
+    city: 'Hubballi',
+    state: 'Karnataka',
+    address: 'PB Road, Vidyanagar, Hubballi',
+    isVerified: true,
+    isActive: true,
+    profileComplete: true,
+    createdAt: '2026-11-01T08:00:00Z',
+    updatedAt: '2026-11-08T10:00:00Z'
+  },
   {
     uid: 'patient-demo-01',
     email: 'patient@carebridge.org',
@@ -443,6 +463,7 @@ export const INITIAL_NOTIFICATIONS: NotificationItem[] = [
 
 const STORAGE_KEY = 'carebridge_unified_store_v2';
 const PROVIDER_ROLES: UserRole[] = ['hospital', 'bloodBank', 'oxygenProvider', 'ambulanceProvider', 'doctor'];
+const ATTENDANT_ROLES: UserRole[] = ['patientAttendant', 'patient_attendant', 'attendant'];
 
 interface StoreState {
   users: UserProfile[];
@@ -455,6 +476,7 @@ interface StoreState {
   oxygenProfiles: Record<string, OxygenProfile>;
   ambulanceProfiles: Record<string, AmbulanceProfile>;
   clinicalNotes: ClinicalNote[];
+  patientLinks: PatientLink[];
 }
 
 type Listener = () => void;
@@ -469,9 +491,13 @@ class DataStore {
 
   private loadState(): StoreState {
     try {
-      const saved = localStorage.getItem(STORAGE_KEY);
-      if (saved) {
-        return JSON.parse(saved);
+      if (typeof window !== 'undefined' && typeof localStorage !== 'undefined') {
+        const saved = localStorage.getItem(STORAGE_KEY);
+        if (saved) {
+          const parsed = JSON.parse(saved);
+          if (!parsed.patientLinks) parsed.patientLinks = [];
+          return parsed;
+        }
       }
     } catch (e) {
       console.warn('Failed to parse saved store, using default demo seed:', e);
@@ -487,13 +513,16 @@ class DataStore {
       bloodBankProfiles: { [INITIAL_BLOOD_BANK.uid]: INITIAL_BLOOD_BANK },
       oxygenProfiles: { [INITIAL_OXYGEN.uid]: INITIAL_OXYGEN },
       ambulanceProfiles: { [INITIAL_AMBULANCE.uid]: INITIAL_AMBULANCE },
-      clinicalNotes: []
+      clinicalNotes: [],
+      patientLinks: []
     };
   }
 
   private saveState() {
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(this.state));
+      if (typeof window !== 'undefined' && typeof localStorage !== 'undefined') {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(this.state));
+      }
     } catch (e) {
       console.error('Failed to save store to localStorage:', e);
     }
@@ -707,6 +736,49 @@ class DataStore {
     this.saveState();
   }
 
+  public getDoctorProfile(uid: string): UserProfile | undefined {
+    const user = this.getUser(uid);
+    return user?.role === 'doctor' ? user : (this.getUsers().find(u => u.role === 'doctor'));
+  }
+
+  public getAllHospitalProfiles(): HospitalProfile[] {
+    return Object.values(this.state.hospitalProfiles);
+  }
+
+  public getAllBloodBankProfiles(): BloodBankProfile[] {
+    return Object.values(this.state.bloodBankProfiles);
+  }
+
+  public getAllOxygenProfiles(): OxygenProfile[] {
+    return Object.values(this.state.oxygenProfiles);
+  }
+
+  public getAllAmbulanceProfiles(): AmbulanceProfile[] {
+    return Object.values(this.state.ambulanceProfiles);
+  }
+
+  // --- Patient Links (Attendant <-> Patient Relationship) ---
+  public getPatientLinks(attendantUid: string): PatientLink[] {
+    return (this.state.patientLinks || []).filter((l) => l.attendantUid === attendantUid);
+  }
+
+  public savePatientLink(link: PatientLink) {
+    if (!this.state.patientLinks) this.state.patientLinks = [];
+    const idx = this.state.patientLinks.findIndex((l) => l.id === link.id);
+    if (idx >= 0) {
+      this.state.patientLinks[idx] = { ...link, updatedAt: new Date().toISOString() };
+    } else {
+      this.state.patientLinks.unshift(link);
+    }
+    this.saveState();
+  }
+
+  public deletePatientLink(linkId: string) {
+    if (!this.state.patientLinks) return;
+    this.state.patientLinks = this.state.patientLinks.filter((l) => l.id !== linkId);
+    this.saveState();
+  }
+
   // --- Emergency Cases ---
   public getCases(): EmergencyCase[] {
     return [...this.state.cases];
@@ -714,6 +786,23 @@ class DataStore {
 
   public getCasesForPatient(patientUid: string): EmergencyCase[] {
     return this.state.cases.filter((c) => c.patientUid === patientUid);
+  }
+
+  public getCasesForAttendant(attendantUid: string, linkedPatientUids: string[] = []): EmergencyCase[] {
+    // Strictly retrieve only cases associated with this attendant UID or their authorized, consented linked patients
+    const consentedPatientUids = this.getPatientLinks(attendantUid)
+      .filter((l) => l.consentGranted === true && l.consentStatus === 'granted')
+      .map((l) => l.patientUid);
+
+    return this.state.cases.filter((c) => {
+      if (c.attendantUid === attendantUid) return true;
+      if (c.attendant && c.attendant.uid === attendantUid) return true;
+      if (c.patientUid === attendantUid) return true;
+      if (c.requesterUid === attendantUid) return true;
+      // Accessing patient's records strictly requires verified patient consent
+      if (consentedPatientUids.includes(c.patientUid) && linkedPatientUids.includes(c.patientUid)) return true;
+      return false;
+    });
   }
 
   public getCase(caseId: string): EmergencyCase | undefined {
@@ -946,8 +1035,13 @@ class DataStore {
   }
 
   public createCase(newCase: EmergencyCase) {
-    this.state.cases = this.state.cases.filter((item) => item.caseId !== newCase.caseId);
-    this.state.cases.unshift(newCase);
+    // Check if case already exists in local list
+    const existingIdx = this.state.cases.findIndex((c) => c.caseId === newCase.caseId);
+    if (existingIdx >= 0) {
+      this.state.cases[existingIdx] = { ...newCase, updatedAt: new Date().toISOString() };
+    } else {
+      this.state.cases.unshift(newCase);
+    }
     this.saveState();
   }
 
@@ -956,16 +1050,45 @@ class DataStore {
     requestDrafts: ResourceRequestDraft[],
     city: string
   ): Promise<{ requests: ResourceRequest[]; hospitalName: string; alreadySubmitted: boolean }> {
-    if (!isFirebaseConfigured || !db) {
-      throw new Error('Emergency submissions require a configured Firebase project. No data was saved.');
-    }
-    if (!auth.currentUser || auth.currentUser.uid !== emergencyCase.patientUid) {
-      throw new Error('The signed-in patient does not match this emergency case. No data was saved.');
+    if (!isFirebaseConfigured || !db || !auth.currentUser) {
+      throw new Error('Emergency submissions require an authenticated Firebase account. No data was saved.');
     }
 
-    const patientSnapshot = await getDoc(doc(db, 'users', auth.currentUser.uid));
-    if (!patientSnapshot.exists() || patientSnapshot.data().role !== 'patient') {
-      throw new Error('Only an authorized patient account can submit an emergency case.');
+    const requesterUid = auth.currentUser.uid;
+    const requesterSnapshot = await getDoc(doc(db, 'users', requesterUid));
+    const patientSnapshot = await getDoc(doc(db, 'users', emergencyCase.patientUid));
+    if (!requesterSnapshot.exists() || !patientSnapshot.exists()) {
+      throw new Error('The requester or patient account could not be verified. No data was saved.');
+    }
+
+    const requester = requesterSnapshot.data();
+    const patient = patientSnapshot.data();
+    if (
+      requester.isActive !== true ||
+      patient.role !== 'patient' ||
+      patient.isActive !== true ||
+      (emergencyCase.requesterUid && emergencyCase.requesterUid !== requesterUid)
+    ) {
+      throw new Error('The requester is not authorized to submit this emergency case.');
+    }
+
+    const isSelfSubmission = requesterUid === emergencyCase.patientUid && requester.role === 'patient';
+    if (!isSelfSubmission) {
+      const linkId = `${requesterUid}_${emergencyCase.patientUid}`;
+      const patientLinkSnapshot = await getDoc(doc(db, 'patientLinks', linkId));
+      const nestedLinkSnapshot = await getDoc(doc(db, 'users', emergencyCase.patientUid, 'attendants', requesterUid));
+      const hasPatientLink = patientLinkSnapshot.exists() &&
+        patientLinkSnapshot.data().attendantUid === requesterUid &&
+        patientLinkSnapshot.data().patientUid === emergencyCase.patientUid &&
+        patientLinkSnapshot.data().consentGranted === true &&
+        patientLinkSnapshot.data().consentStatus === 'granted';
+      const hasNestedLink = nestedLinkSnapshot.exists() &&
+        nestedLinkSnapshot.data().attendantUid === requesterUid &&
+        nestedLinkSnapshot.data().patientUid === emergencyCase.patientUid &&
+        nestedLinkSnapshot.data().activeConsent === true;
+      if (!ATTENDANT_ROLES.includes(requester.role) || (!hasPatientLink && !hasNestedLink)) {
+        throw new Error('Active patient consent is required before an attendant can submit an emergency case.');
+      }
     }
 
     const caseRef = doc(db, 'cases', emergencyCase.caseId);
@@ -973,7 +1096,8 @@ class DataStore {
     if (existingCaseSnapshot.exists()) {
       const existingCase = existingCaseSnapshot.data() as EmergencyCase;
       if (
-        existingCase.patientUid !== auth.currentUser.uid ||
+        existingCase.patientUid !== emergencyCase.patientUid ||
+        existingCase.requesterUid !== requesterUid ||
         existingCase.submissionFingerprint !== emergencyCase.submissionFingerprint
       ) {
         throw new Error('This emergency submission ID is already in use. Start a new case to submit different details.');
@@ -997,8 +1121,8 @@ class DataStore {
         if (
           requestData.requestId !== requestId ||
           requestData.caseId !== emergencyCase.caseId ||
-          requestData.patientUid !== auth.currentUser?.uid ||
-          requestData.requesterUid !== auth.currentUser?.uid ||
+          requestData.patientUid !== emergencyCase.patientUid ||
+          requestData.requesterUid !== requesterUid ||
           requestData.resourceType !== draft.resourceType ||
           typeof requestData.providerUid !== 'string' ||
           typeof requestData.providerName !== 'string' ||
@@ -1008,19 +1132,10 @@ class DataStore {
           throw new Error('Saved request details do not match this case. Please contact support.');
         }
 
-        const toIsoString = (value: unknown) => {
-          if (typeof value === 'string' && !Number.isNaN(Date.parse(value))) return value;
-          if (value && typeof value === 'object' && 'toDate' in value && typeof value.toDate === 'function') {
-            const date = value.toDate() as Date;
-            if (!Number.isNaN(date.getTime())) return date.toISOString();
-          }
-          throw new Error('Saved request timestamps could not be verified. Please contact support.');
-        };
-
         return {
           ...requestData,
-          createdAt: toIsoString(requestData.createdAt),
-          updatedAt: toIsoString(requestData.updatedAt)
+          createdAt: firestoreDateToIso(requestData.createdAt),
+          updatedAt: firestoreDateToIso(requestData.updatedAt)
         } as ResourceRequest;
       }));
       const hospitalName = existingCase.matchedHospitalName;
@@ -1030,12 +1145,6 @@ class DataStore {
 
       this.createCase({ ...emergencyCase, matchedHospitalName: hospitalName, requestCount: 0 });
       existingRequests.forEach((request) => this.createRequest(request));
-      const localCase = this.getCase(emergencyCase.caseId);
-      if (localCase) {
-        localCase.requestCount = existingRequests.length;
-        this.saveState();
-      }
-
       return { requests: existingRequests, hospitalName, alreadySubmitted: true };
     }
 
@@ -1071,27 +1180,26 @@ class DataStore {
     const requests = requestDrafts.map((draft) => {
       const candidates = byRole(draft.providerRole);
       const provider = draft.providerRole === 'doctor'
-        ? candidates.find(
-            (candidate) =>
-              candidate.hospitalAffiliation?.trim().toLocaleLowerCase() ===
-              hospitalProvider.displayName.trim().toLocaleLowerCase()
+        ? candidates.find((candidate) =>
+            candidate.hospitalAffiliation?.trim().toLocaleLowerCase() ===
+            hospitalProvider.displayName.trim().toLocaleLowerCase()
           )
         : candidates[0];
-
       if (!provider) {
-        const roleLabel = draft.providerRole === 'doctor' ? 'doctor affiliated with the matched hospital' : draft.providerRole;
-        throw new Error(`No active, verified ${roleLabel} is available. No data was saved.`);
+        const label = draft.providerRole === 'doctor'
+          ? 'doctor affiliated with the matched hospital'
+          : draft.providerRole;
+        throw new Error(`No active, verified ${label} is available. No data was saved.`);
       }
 
       const requestId = `REQ-${emergencyCase.caseId}-${draft.resourceType}`;
-      const requestRef = doc(db, 'requests', requestId);
       return {
-        ref: requestRef,
+        ref: doc(db, 'requests', requestId),
         request: {
           requestId,
           caseId: emergencyCase.caseId,
           patientUid: emergencyCase.patientUid,
-          requesterUid: emergencyCase.patientUid,
+          requesterUid,
           patientName: emergencyCase.patientName,
           providerUid: provider.uid,
           providerName: provider.displayName,
@@ -1109,10 +1217,10 @@ class DataStore {
     const batch = writeBatch(db);
     batch.set(caseRef, {
       ...emergencyCase,
+      requesterUid,
+      requesterRole: requester.role,
+      attendantUid: isSelfSubmission ? emergencyCase.attendantUid : requesterUid,
       matchedHospitalName: hospitalProvider.displayName,
-      attendantConsent: emergencyCase.attendantConsent
-        ? { ...emergencyCase.attendantConsent, grantedAt: serverTimestamp() }
-        : null,
       createdAt: serverTimestamp(),
       updatedAt: serverTimestamp()
     });
@@ -1125,11 +1233,15 @@ class DataStore {
     });
     await batch.commit();
 
-    this.createCase({
+    const savedCase = {
       ...emergencyCase,
+      requesterUid,
+      requesterRole: requester.role,
+      attendantUid: isSelfSubmission ? emergencyCase.attendantUid : requesterUid,
       matchedHospitalName: hospitalProvider.displayName,
       requestCount: 0
-    });
+    };
+    this.createCase(savedCase);
     requests.forEach(({ request }) => this.createRequest(request));
 
     return {
@@ -1139,24 +1251,218 @@ class DataStore {
     };
   }
 
-  public updateCaseStatus(caseId: string, status: 'active' | 'resolved' | 'cancelled') {
+  public updateCaseStatus(
+    caseId: string,
+    status: CaseStatus,
+    updater?: { uid: string; name: string; role: string; note?: string; reason?: string }
+  ) {
     const item = this.state.cases.find((c) => c.caseId === caseId);
     if (item) {
       item.status = status;
       item.updatedAt = new Date().toISOString();
+      if (updater?.reason) {
+        if (status === 'REJECTED') item.rejectionReason = updater.reason;
+        if (status === 'cancelled') item.cancellationReason = updater.reason;
+      }
 
-      if (status === 'cancelled') {
+      if (!item.auditHistory) item.auditHistory = [];
+      item.auditHistory.push({
+        id: 'audit-' + Date.now() + '-' + Math.random().toString(36).substring(2, 7),
+        status,
+        updatedByUid: updater?.uid || 'system',
+        updatedByName: updater?.name || 'CareBridge Coordinator',
+        role: updater?.role || 'admin',
+        timestamp: new Date().toISOString(),
+        note: updater?.note,
+        reason: updater?.reason
+      });
+
+      if (status === 'cancelled' || status === 'REJECTED') {
         // Automatically cancel any pending requests
         this.state.requests
-          .filter((r) => r.caseId === caseId && r.status === 'pending')
+          .filter((r) => r.caseId === caseId && (r.status === 'pending' || r.status === 'REQUESTED' || r.status === 'UNDER_REVIEW'))
           .forEach((r) => {
             r.status = 'cancelled';
             r.updatedAt = new Date().toISOString();
           });
       }
 
+      // Notify patient and attendant of emergency status progress
+      const recipients = Array.from(new Set([item.patientUid, item.attendantUid, item.attendant?.uid].filter(Boolean))) as string[];
+      recipients.forEach((recipUid) => {
+        this.addNotification({
+          id: 'notif-' + Date.now() + '-' + recipUid.slice(-4),
+          recipientUid: recipUid,
+          type: 'system_alert',
+          title: `Emergency ${item.caseId} Status: ${String(status).replace('_', ' ')}`,
+          message: `Case condition status updated to "${String(status).replace('_', ' ')}"${updater?.note ? ` - ${updater.note}` : ''}.`,
+          relatedCaseId: item.caseId,
+          isRead: false,
+          createdAt: new Date().toISOString()
+        });
+      });
+
       this.saveState();
     }
+  }
+
+  public assignProvidersToCase(
+    caseId: string,
+    assignments: {
+      hospital?: { uid: string; name: string };
+      bloodBank?: { uid: string; name: string };
+      oxygenProvider?: { uid: string; name: string };
+      ambulanceProvider?: { uid: string; name: string };
+    },
+    coordinator: { uid: string; name: string }
+  ) {
+    const emergencyCase = this.state.cases.find((c) => c.caseId === caseId);
+    if (!emergencyCase) return;
+
+    if (assignments.hospital) {
+      emergencyCase.assignedHospitalUid = assignments.hospital.uid;
+      emergencyCase.assignedHospitalName = assignments.hospital.name;
+    }
+    if (assignments.bloodBank) {
+      emergencyCase.assignedBloodBankUid = assignments.bloodBank.uid;
+      emergencyCase.assignedBloodBankName = assignments.bloodBank.name;
+    }
+    if (assignments.oxygenProvider) {
+      emergencyCase.assignedOxygenUid = assignments.oxygenProvider.uid;
+      emergencyCase.assignedOxygenName = assignments.oxygenProvider.name;
+    }
+    if (assignments.ambulanceProvider) {
+      emergencyCase.assignedAmbulanceUid = assignments.ambulanceProvider.uid;
+      emergencyCase.assignedAmbulanceName = assignments.ambulanceProvider.name;
+    }
+
+    emergencyCase.status = 'ASSIGNED';
+    emergencyCase.updatedAt = new Date().toISOString();
+
+    if (!emergencyCase.auditHistory) emergencyCase.auditHistory = [];
+    emergencyCase.auditHistory.push({
+      id: 'audit-' + Date.now() + '-' + Math.random().toString(36).substring(2, 7),
+      status: 'ASSIGNED',
+      updatedByUid: coordinator.uid,
+      updatedByName: coordinator.name,
+      role: 'admin',
+      timestamp: new Date().toISOString(),
+      note: `Providers assigned by Central Coordinator: ${[
+        assignments.hospital?.name,
+        assignments.bloodBank?.name,
+        assignments.oxygenProvider?.name,
+        assignments.ambulanceProvider?.name
+      ].filter(Boolean).join(', ')}`
+    });
+
+    // Create / update resource requests for each assigned provider
+    const createdReqs: ResourceRequest[] = [];
+    const now = new Date().toISOString();
+    const resourcesNeeded = emergencyCase.resourcesNeeded || [];
+    const incidentAddress = emergencyCase.location?.address || emergencyCase.incidentAddress || '';
+
+    if (assignments.hospital && resourcesNeeded.some((r) => r === 'bed' || r === 'icu' || r === 'Hospital Beds' || r === 'ICU Facilities')) {
+      const isICU = resourcesNeeded.some((r) => r === 'icu' || r === 'ICU Facilities') || !!emergencyCase.quotas?.icuRequired;
+      createdReqs.push({
+        requestId: `REQ-${Date.now().toString().slice(-6)}-HOSP`,
+        caseId: emergencyCase.caseId,
+        patientUid: emergencyCase.patientUid,
+        patientName: emergencyCase.patientName,
+        providerUid: assignments.hospital.uid,
+        providerName: assignments.hospital.name,
+        resourceType: isICU ? 'icu' : 'bed',
+        details: {
+          bedType: isICU ? 'ICU Bed with Ventilator Support' : 'Emergency General Bed',
+          notes: emergencyCase.conditionSummary,
+          pickupAddress: incidentAddress,
+          destinationAddress: assignments.hospital.name
+        },
+        status: 'ASSIGNED',
+        createdAt: now,
+        updatedAt: now
+      });
+    }
+
+    if (assignments.bloodBank && resourcesNeeded.some((r) => r === 'blood' || r === 'Blood' || r === 'Blood Units')) {
+      createdReqs.push({
+        requestId: `REQ-${Date.now().toString().slice(-6)}-BLD`,
+        caseId: emergencyCase.caseId,
+        patientUid: emergencyCase.patientUid,
+        patientName: emergencyCase.patientName,
+        providerUid: assignments.bloodBank.uid,
+        providerName: assignments.bloodBank.name,
+        resourceType: 'blood',
+        details: {
+          bloodGroup: emergencyCase.quotas?.bloodGroup || emergencyCase.patientBloodGroup || 'O+',
+          units: emergencyCase.quotas?.bloodUnits || 2,
+          notes: `Emergency transfusion requisition for ${emergencyCase.patientName}`
+        },
+        status: 'ASSIGNED',
+        createdAt: now,
+        updatedAt: now
+      });
+    }
+
+    if (assignments.oxygenProvider && resourcesNeeded.some((r) => r === 'oxygen' || r === 'Oxygen' || r === 'Oxygen Supply')) {
+      createdReqs.push({
+        requestId: `REQ-${Date.now().toString().slice(-6)}-OXY`,
+        caseId: emergencyCase.caseId,
+        patientUid: emergencyCase.patientUid,
+        patientName: emergencyCase.patientName,
+        providerUid: assignments.oxygenProvider.uid,
+        providerName: assignments.oxygenProvider.name,
+        resourceType: 'oxygen',
+        details: {
+          cylinders: emergencyCase.quotas?.oxygenQuantity || 2,
+          notes: 'High-flow oxygen administration supply'
+        },
+        status: 'ASSIGNED',
+        createdAt: now,
+        updatedAt: now
+      });
+    }
+
+    if (assignments.ambulanceProvider && resourcesNeeded.some((r) => r === 'ambulance' || r === 'Ambulance' || r === 'Ambulance Services')) {
+      createdReqs.push({
+        requestId: `REQ-${Date.now().toString().slice(-6)}-AMB`,
+        caseId: emergencyCase.caseId,
+        patientUid: emergencyCase.patientUid,
+        patientName: emergencyCase.patientName,
+        providerUid: assignments.ambulanceProvider.uid,
+        providerName: assignments.ambulanceProvider.name,
+        resourceType: 'ambulance',
+        details: {
+          vehicleType: emergencyCase.quotas?.ambulanceType || 'ALS',
+          pickupAddress: incidentAddress,
+          destinationAddress: assignments.hospital?.name || 'Designated Hospital Facility'
+        },
+        status: 'ASSIGNED',
+        createdAt: now,
+        updatedAt: now
+      });
+    }
+
+    // Add created requests to store and notify each assigned provider
+    createdReqs.forEach((req) => {
+      this.createRequest(req);
+    });
+
+    // Notify patient/attendant
+    const recipients = Array.from(new Set([emergencyCase.patientUid, emergencyCase.attendantUid, emergencyCase.attendant?.uid].filter(Boolean))) as string[];
+    recipients.forEach((recipUid) => {
+      this.addNotification({
+        id: 'notif-' + Date.now() + '-' + recipUid.slice(-4),
+        recipientUid: recipUid,
+        type: 'request_accepted',
+        title: `Providers Assigned for ${emergencyCase.caseId}`,
+        message: `Coordinator has assigned facilities for your emergency. Hospital: ${assignments.hospital?.name || 'Pending'}, Ambulance: ${assignments.ambulanceProvider?.name || 'Pending'}.`,
+        relatedCaseId: emergencyCase.caseId,
+        isRead: false,
+        createdAt: new Date().toISOString()
+      });
+    });
+
+    this.saveState();
   }
 
   // --- Resource Requests ---
@@ -1281,20 +1587,81 @@ class DataStore {
       this.state.trips.unshift(newTrip);
     }
 
-    // Notify Patient
-    this.addNotification({
-      id: 'notif-' + Date.now(),
-      recipientUid: req.patientUid,
-      type: status === 'accepted' ? 'request_accepted' : 'request_rejected',
-      title: `${req.providerName} ${status === 'accepted' ? 'Accepted' : 'Declined'}`,
-      message:
-        status === 'accepted'
-          ? `Your ${req.resourceType.toUpperCase()} request has been accepted by ${req.providerName}.`
-          : `Your request was declined: ${reason || 'Capacity exceeded'}. You can request other providers.`,
-      relatedCaseId: req.caseId,
-      relatedRequestId: req.requestId,
-      isRead: false,
-      createdAt: new Date().toISOString()
+    // Check if parent case needs lifecycle advancement
+    const parentCase = this.state.cases.find((c) => c.caseId === req.caseId);
+    if (parentCase) {
+      if (status === 'accepted') {
+        const caseReqs = this.state.requests.filter((r) => r.caseId === req.caseId);
+        const allAccepted = caseReqs.length > 0 && caseReqs.every((r) => r.status === 'accepted');
+        parentCase.status = allAccepted ? 'RESOURCE_CONFIRMED' : 'ACCEPTED';
+        parentCase.updatedAt = new Date().toISOString();
+
+        if (!parentCase.auditHistory) parentCase.auditHistory = [];
+        parentCase.auditHistory.push({
+          id: 'audit-' + Date.now() + '-' + Math.random().toString(36).substring(2, 7),
+          status: parentCase.status,
+          updatedByUid: req.providerUid,
+          updatedByName: req.providerName,
+          role: req.resourceType,
+          timestamp: new Date().toISOString(),
+          note: `${req.providerName} accepted ${req.resourceType.toUpperCase()} request.`
+        });
+      } else if (status === 'rejected') {
+        if (!parentCase.auditHistory) parentCase.auditHistory = [];
+        parentCase.auditHistory.push({
+          id: 'audit-' + Date.now() + '-' + Math.random().toString(36).substring(2, 7),
+          status: 'UNDER_REVIEW',
+          updatedByUid: req.providerUid,
+          updatedByName: req.providerName,
+          role: req.resourceType,
+          timestamp: new Date().toISOString(),
+          note: `${req.providerName} declined ${req.resourceType.toUpperCase()} request.`,
+          reason
+        });
+      }
+    }
+
+    // Notify Patient & Attendant
+    const patientAndAttendant = Array.from(new Set([
+      req.patientUid,
+      parentCase?.attendantUid,
+      parentCase?.attendant?.uid
+    ].filter(Boolean))) as string[];
+
+    patientAndAttendant.forEach((recip) => {
+      this.addNotification({
+        id: 'notif-' + Date.now() + '-' + recip.slice(-4),
+        recipientUid: recip,
+        type: status === 'accepted' ? 'request_accepted' : 'request_rejected',
+        title: `${req.providerName} ${status === 'accepted' ? 'Accepted' : 'Declined'}`,
+        message:
+          status === 'accepted'
+            ? `Your ${req.resourceType.toUpperCase()} request has been accepted by ${req.providerName}.`
+            : `Your request was declined: ${reason || 'Capacity exceeded'}. Coordinator will reassign suitable provider.`,
+        relatedCaseId: req.caseId,
+        relatedRequestId: req.requestId,
+        isRead: false,
+        createdAt: new Date().toISOString()
+      });
+    });
+
+    // Notify Central Coordinators / Admins about the response
+    const admins = this.state.users.filter((u) => u.role === 'admin');
+    admins.forEach((adminUser) => {
+      this.addNotification({
+        id: 'notif-' + Date.now() + '-' + adminUser.uid.slice(-4),
+        recipientUid: adminUser.uid,
+        type: status === 'accepted' ? 'request_accepted' : 'request_rejected',
+        title: `Provider ${status === 'accepted' ? 'Accepted' : 'REJECTED'}: ${req.providerName}`,
+        message:
+          status === 'accepted'
+            ? `${req.providerName} accepted ${req.resourceType} for case ${req.caseId}.`
+            : `ACTION NEEDED: ${req.providerName} rejected ${req.resourceType} for case ${req.caseId} (Reason: ${reason || 'Capacity full'}). Please reassign.`,
+        relatedCaseId: req.caseId,
+        relatedRequestId: req.requestId,
+        isRead: false,
+        createdAt: new Date().toISOString()
+      });
     });
 
     this.saveState();
@@ -1357,6 +1724,30 @@ class DataStore {
       }
     }
 
+    // Synchronize parent emergency case lifecycle status
+    const parentCase = this.state.cases.find((c) => c.caseId === trip.caseId);
+    if (parentCase) {
+      if (status === 'dispatched') {
+        parentCase.status = 'DISPATCHED';
+      } else if (status === 'picked_up' || status === 'in_transit') {
+        parentCase.status = 'IN_PROGRESS';
+      } else if (status === 'delivered' || status === 'completed') {
+        // If hospital is confirmed, keep as in-progress or completed
+        if (status === 'completed') parentCase.status = 'COMPLETED';
+      }
+      parentCase.updatedAt = new Date().toISOString();
+      if (!parentCase.auditHistory) parentCase.auditHistory = [];
+      parentCase.auditHistory.push({
+        id: 'audit-' + Date.now() + '-' + Math.random().toString(36).substring(2, 7),
+        status: parentCase.status,
+        updatedByUid: trip.providerUid,
+        updatedByName: 'Ambulance Unit ' + trip.vehicleId,
+        role: 'ambulanceProvider',
+        timestamp: new Date().toISOString(),
+        note: `Ambulance trip updated to ${status.replace('_', ' ').toUpperCase()}`
+      });
+    }
+
     // Notify Patient
     this.addNotification({
       id: 'notif-' + Date.now(),
@@ -1412,3 +1803,365 @@ class DataStore {
 
 // Global Singleton Instance
 export const dataStore = new DataStore();
+
+// ==========================================
+// ASYNC FIRESTORE SYNC & PERSISTENCE HELPERS
+// ==========================================
+
+export async function fetchPatientLinksFromFirestore(attendantUid: string): Promise<PatientLink[]> {
+  if (!isFirebaseConfigured || !db) {
+    return dataStore.getPatientLinks(attendantUid);
+  }
+  try {
+    const q = query(collection(db, 'patientLinks'), where('attendantUid', '==', attendantUid));
+    const snap = await getDocs(q);
+    const links: PatientLink[] = [];
+    snap.forEach((d) => {
+      links.push(d.data() as PatientLink);
+    });
+    // Sync to local store
+    links.forEach((l) => dataStore.savePatientLink(l));
+    return links;
+  } catch (err) {
+    console.warn('[CareBridge Firestore] Failed to fetch patient links:', err);
+    return dataStore.getPatientLinks(attendantUid);
+  }
+}
+
+export async function savePatientLinkToFirestore(link: PatientLink): Promise<void> {
+  dataStore.savePatientLink(link);
+  if (isFirebaseConfigured && db) {
+    try {
+      await setDoc(doc(db, 'patientLinks', link.id), link);
+    } catch (err) {
+      console.warn('[CareBridge Firestore] Failed to save patient link:', err);
+    }
+  }
+}
+
+export async function deletePatientLinkFromFirestore(linkId: string): Promise<void> {
+  dataStore.deletePatientLink(linkId);
+  if (isFirebaseConfigured && db) {
+    try {
+      await deleteDoc(doc(db, 'patientLinks', linkId));
+    } catch (err) {
+      console.warn('[CareBridge Firestore] Failed to delete patient link:', err);
+    }
+  }
+}
+
+/**
+ * Real-time Firestore listener for attendant's linked patients
+ * Updates instantly via onSnapshot when patient links change in Firestore
+ */
+export function subscribePatientLinksFromFirestore(
+  attendantUid: string,
+  onUpdate: (links: PatientLink[]) => void
+): () => void {
+  if (!isFirebaseConfigured || !db) {
+    const initial = dataStore.getPatientLinks(attendantUid);
+    onUpdate(initial);
+    return dataStore.subscribe(() => {
+      onUpdate(dataStore.getPatientLinks(attendantUid));
+    });
+  }
+  try {
+    const q = query(collection(db, 'patientLinks'), where('attendantUid', '==', attendantUid));
+    return onSnapshot(
+      q,
+      (snapshot) => {
+        const links: PatientLink[] = [];
+        snapshot.forEach((doc) => {
+          links.push(doc.data() as PatientLink);
+        });
+        links.forEach((l) => dataStore.savePatientLink(l));
+        onUpdate(links);
+      },
+      (error) => {
+        console.warn('[CareBridge Firestore] onSnapshot error on patientLinks:', error);
+        onUpdate(dataStore.getPatientLinks(attendantUid));
+      }
+    );
+  } catch (err) {
+    console.warn('[CareBridge Firestore] Failed to subscribe to patientLinks:', err);
+    onUpdate(dataStore.getPatientLinks(attendantUid));
+    return () => {};
+  }
+}
+
+/**
+ * Real-time Firestore listener for attendant's emergency cases
+ * Listens for live dispatch status updates on cases owned by this attendant
+ */
+export function subscribeCasesForAttendantFromFirestore(
+  attendantUid: string,
+  linkedPatientUids: string[] = [],
+  onUpdate: (cases: EmergencyCase[]) => void
+): () => void {
+  if (!isFirebaseConfigured || !db) {
+    const initial = dataStore.getCasesForAttendant(attendantUid, linkedPatientUids);
+    onUpdate(initial);
+    return dataStore.subscribe(() => {
+      onUpdate(dataStore.getCasesForAttendant(attendantUid, linkedPatientUids));
+    });
+  }
+  try {
+    const q = query(collection(db, 'cases'), where('attendantUid', '==', attendantUid));
+    return onSnapshot(
+      q,
+      (snapshot) => {
+        const cases: EmergencyCase[] = [];
+        snapshot.forEach((doc) => {
+          cases.push(doc.data() as EmergencyCase);
+        });
+        cases.forEach((c) => dataStore.createCase(c));
+        const combined = Array.from(
+          new Map([...dataStore.getCasesForAttendant(attendantUid, linkedPatientUids), ...cases].map((c) => [c.caseId, c])).values()
+        );
+        onUpdate(combined);
+      },
+      (error) => {
+        console.warn('[CareBridge Firestore] onSnapshot error on cases:', error);
+        onUpdate(dataStore.getCasesForAttendant(attendantUid, linkedPatientUids));
+      }
+    );
+  } catch (err) {
+    console.warn('[CareBridge Firestore] Failed to subscribe to cases:', err);
+    onUpdate(dataStore.getCasesForAttendant(attendantUid, linkedPatientUids));
+    return () => {};
+  }
+}
+
+export async function fetchCasesForAttendantFromFirestore(
+  attendantUid: string,
+  linkedPatientUids: string[] = []
+): Promise<EmergencyCase[]> {
+  if (!isFirebaseConfigured || !db) {
+    return dataStore.getCasesForAttendant(attendantUid, linkedPatientUids);
+  }
+  try {
+    const casesMap = new Map<string, EmergencyCase>();
+
+    // 1. Cases where user is the attendant
+    try {
+      const q1 = query(collection(db, 'cases'), where('attendantUid', '==', attendantUid));
+      const snap1 = await getDocs(q1);
+      snap1.forEach((d) => {
+        const c = d.data() as EmergencyCase;
+        casesMap.set(c.caseId, c);
+      });
+    } catch (e) {
+      console.warn('[CareBridge Firestore] Query by attendantUid note:', e);
+    }
+
+    // 2. Cases where user is the patient directly (self-created cases or patient account)
+    try {
+      const qSelf = query(collection(db, 'cases'), where('patientUid', '==', attendantUid));
+      const snapSelf = await getDocs(qSelf);
+      snapSelf.forEach((d) => {
+        const c = d.data() as EmergencyCase;
+        casesMap.set(c.caseId, c);
+      });
+    } catch (e) {
+      console.warn('[CareBridge Firestore] Query by patientUid self note:', e);
+    }
+
+    // 3. Cases for linked patient UIDs (attendant accessing authorized patients)
+    for (const pUid of linkedPatientUids) {
+      try {
+        const qP = query(collection(db, 'cases'), where('patientUid', '==', pUid));
+        const snapP = await getDocs(qP);
+        snapP.forEach((d) => {
+          const c = d.data() as EmergencyCase;
+          casesMap.set(c.caseId, c);
+        });
+      } catch (e) {
+        console.warn('[CareBridge Firestore] Query by patientUid note:', e);
+      }
+    }
+
+    const results = Array.from(casesMap.values()).sort(
+      (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+    );
+    // sync to local store
+    results.forEach((c) => dataStore.createCase(c));
+    return results;
+  } catch (err) {
+    console.warn('[CareBridge Firestore] Failed to fetch cases for attendant:', err);
+    return dataStore.getCasesForAttendant(attendantUid, linkedPatientUids);
+  }
+}
+
+export interface CaseValidationResult {
+  isValid: boolean;
+  valid: boolean;
+  errors: Record<string, string>;
+  errorList: string[];
+}
+
+export function validateEmergencyCasePayload(
+  payload: Partial<EmergencyCase>,
+  requester: { uid: string; role: string },
+  linkedPatients: PatientLink[] = []
+): CaseValidationResult {
+  const errors: Record<string, string> = {};
+
+  // 1. Patient Information
+  if (!payload.patientName || !payload.patientName.trim()) {
+    errors.patientName = 'Patient full name is required.';
+  }
+  const patientUid = payload.patientUid || payload.patientId;
+  if (!patientUid || !patientUid.trim()) {
+    errors.patientUid = 'Patient ID is required.';
+  }
+  const age = Number(payload.patientAge);
+  if (payload.patientAge === undefined || payload.patientAge === null || isNaN(age) || age <= 0 || age > 130) {
+    errors.patientAge = 'Please enter a valid patient age (1–130).';
+  }
+  if (!payload.patientGender || !payload.patientGender.trim()) {
+    errors.patientGender = 'Patient gender is required.';
+  }
+
+  // 2. Authorization and Consent
+  const isSelf = requester.role === 'patient' || requester.uid === patientUid;
+  if (!isSelf) {
+    const link = linkedPatients.find((l) => l.patientUid === patientUid);
+    if (!link) {
+      errors.authorization = 'Unauthorized: You are not authorized to create emergency cases for unrelated patients.';
+    } else if (!link.consentGranted || link.consentStatus !== 'granted') {
+      errors.consent = 'Valid, active patient consent is required before creating an emergency case on behalf of this patient.';
+    }
+  }
+
+  // 3. Emergency Details
+  const category = payload.category || payload.emergencyCategory;
+  if (!category || !category.trim()) {
+    errors.category = 'Please select an emergency category.';
+  }
+  const condition = payload.conditionSummary || payload.patientCondition || payload.emergencyDescription;
+  if (!condition || !condition.trim()) {
+    errors.conditionSummary = 'Emergency condition description is required.';
+  }
+  const priority = payload.priority || payload.emergencyPriority || payload.triagePriority;
+  if (!priority) {
+    errors.priority = 'Please select an emergency priority level.';
+  }
+
+  // 4. Required Services
+  const services = payload.requiredServices || payload.resourcesNeeded || [];
+  if (!services || services.length === 0) {
+    errors.services = 'Please select at least one emergency service (Hospital admission, Blood, Oxygen, Ambulance, or Doctor assistance).';
+  }
+
+  const hasBlood = services.some((s) => s.toLowerCase().includes('blood')) || Boolean(payload.quotas?.bloodRequired);
+  if (hasBlood) {
+    const bloodGroup = payload.quotas?.bloodGroup || payload.patientBloodGroup;
+    const bloodUnits = Number(payload.quotas?.bloodUnits ?? payload.quotas?.bloodUnitsRequested);
+    if (!bloodGroup || bloodGroup === 'Unknown' || !bloodGroup.trim()) {
+      errors.bloodGroup = 'Blood group must be specified when blood requirement is selected.';
+    }
+    if (!bloodUnits || isNaN(bloodUnits) || bloodUnits <= 0) {
+      errors.bloodUnits = 'Number of blood units required must be at least 1.';
+    }
+  }
+
+  const hasOxygen = services.some((s) => s.toLowerCase().includes('oxygen')) || Boolean(payload.quotas?.oxygenRequired);
+  if (hasOxygen) {
+    const oxyType = payload.quotas?.oxygenType;
+    const oxyQty = Number(payload.quotas?.oxygenQuantity ?? payload.quotas?.oxygenCylindersRequested);
+    if (!oxyType) {
+      errors.oxygenType = 'Oxygen supply type (cylinder, concentrator, or both) must be specified.';
+    }
+    if (!oxyQty || isNaN(oxyQty) || oxyQty <= 0) {
+      errors.oxygenQuantity = 'Oxygen supply quantity must be at least 1.';
+    }
+  }
+
+  // 5. Location
+  const address = payload.location?.address || payload.incidentAddress;
+  if (!address || !address.trim()) {
+    errors.location = 'Current emergency location address / landmark is required.';
+  }
+
+  // 6. Contact Information
+  const contactPerson = payload.contactPerson || payload.attendant?.name || payload.attendantName || payload.patientName;
+  const contactPhone = payload.contactPhone || payload.attendant?.phone || payload.attendantPhone || payload.patientPhone;
+  if (!contactPerson || !contactPerson.trim()) {
+    errors.contactPerson = 'Contact person name is required.';
+  }
+  if (!contactPhone || !contactPhone.trim() || contactPhone.trim().length < 8) {
+    errors.contactPhone = 'Please enter a valid emergency contact phone number.';
+  }
+
+  const isValid = Object.keys(errors).length === 0;
+  return {
+    isValid,
+    valid: isValid,
+    errors,
+    errorList: Object.values(errors)
+  };
+}
+
+export async function createEmergencyCase(
+  caseRecord: EmergencyCase,
+  requester: { uid: string; role: string },
+  linkedPatients: PatientLink[] = []
+): Promise<{ success: boolean; caseId: string; error?: string }> {
+  // 1. Enforce validation before writing
+  const validation = validateEmergencyCasePayload(caseRecord, requester, linkedPatients);
+  if (!validation.isValid) {
+    const firstErr = validation.errorList[0] || 'Emergency case validation failed';
+    return { success: false, caseId: caseRecord.caseId, error: firstErr };
+  }
+
+  // 2. Prevent duplicate submissions / idempotency
+  const existing = dataStore.getCase(caseRecord.caseId);
+  if (existing) {
+    return { success: true, caseId: caseRecord.caseId };
+  }
+
+  // 3. Save to local data store
+  dataStore.createCase(caseRecord);
+
+  // 4. Save to Firestore if configured
+  if (isFirebaseConfigured && db) {
+    try {
+      await setDoc(doc(db, 'cases', caseRecord.caseId), caseRecord);
+    } catch (err: any) {
+      console.warn('[CareBridge Firestore] Failed to write case to Firestore:', err);
+      throw err;
+    }
+  }
+
+  return { success: true, caseId: caseRecord.caseId };
+}
+
+export async function saveCaseToFirestore(emergencyCase: EmergencyCase): Promise<void> {
+  dataStore.createCase(emergencyCase);
+  if (isFirebaseConfigured && db) {
+    try {
+      await setDoc(doc(db, 'cases', emergencyCase.caseId), emergencyCase);
+    } catch (err) {
+      console.warn('[CareBridge Firestore] Failed to write case to Firestore:', err);
+    }
+  }
+}
+
+export async function fetchRequestsForCasesFromFirestore(caseIds: string[]): Promise<ResourceRequest[]> {
+  if (caseIds.length === 0) return [];
+  if (!isFirebaseConfigured || !db) {
+    return dataStore.getRequests().filter((r) => caseIds.includes(r.caseId));
+  }
+  try {
+    const reqs: ResourceRequest[] = [];
+    for (const cId of caseIds) {
+      const q = query(collection(db, 'requests'), where('caseId', '==', cId));
+      const snap = await getDocs(q);
+      snap.forEach((d) => reqs.push(d.data() as ResourceRequest));
+    }
+    return reqs;
+  } catch (err) {
+    console.warn('[CareBridge Firestore] Failed to fetch requests for cases:', err);
+    return dataStore.getRequests().filter((r) => caseIds.includes(r.caseId));
+  }
+}

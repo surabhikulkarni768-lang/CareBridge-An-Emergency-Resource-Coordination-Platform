@@ -47,14 +47,26 @@ export const Header: React.FC<HeaderProps> = ({
 
   const unreadCount = notifications.filter((n) => !n.isRead).length;
 
-  const roleLabels: Record<UserRole, { label: string; icon: React.ReactNode; color: string }> = {
+  const roleLabels: Record<string, { label: string; icon: React.ReactNode; color: string }> = {
     patient: { label: 'Patient / Attendant', icon: <User className="w-3.5 h-3.5" />, color: 'bg-teal-600 text-white' },
+    patientAttendant: { label: 'Patient Attendant', icon: <User className="w-3.5 h-3.5" />, color: 'bg-teal-600 text-white' },
+    patient_attendant: { label: 'Patient Attendant', icon: <User className="w-3.5 h-3.5" />, color: 'bg-teal-600 text-white' },
+    attendant: { label: 'Patient Attendant', icon: <User className="w-3.5 h-3.5" />, color: 'bg-teal-600 text-white' },
     hospital: { label: 'Hospital Facility', icon: <Building2 className="w-3.5 h-3.5" />, color: 'bg-blue-600 text-white' },
     bloodBank: { label: 'Blood Bank', icon: <Droplet className="w-3.5 h-3.5" />, color: 'bg-rose-600 text-white' },
     oxygenProvider: { label: 'Oxygen Depot', icon: <Wind className="w-3.5 h-3.5" />, color: 'bg-sky-600 text-white' },
     ambulanceProvider: { label: 'Ambulance Service', icon: <Truck className="w-3.5 h-3.5" />, color: 'bg-amber-600 text-white' },
     doctor: { label: 'Medical Staff / Physician', icon: <Stethoscope className="w-3.5 h-3.5" />, color: 'bg-emerald-600 text-white' },
     admin: { label: 'Central Coordinator / Admin', icon: <Shield className="w-3.5 h-3.5" />, color: 'bg-purple-600 text-white' }
+  };
+
+  const getEffectiveRoleBadge = () => {
+    if (!activeRole) return null;
+    const roleKey = String(activeRole);
+    if (roleKey === 'patientAttendant' || roleKey === 'patient_attendant' || roleKey === 'attendant') {
+      return { label: 'Patient Attendant', icon: <User className="w-3.5 h-3.5" />, color: 'bg-teal-600 text-white' };
+    }
+    return roleLabels[roleKey] || { label: 'Patient / Attendant', icon: <User className="w-3.5 h-3.5" />, color: 'bg-teal-600 text-white' };
   };
 
   return (
@@ -86,14 +98,18 @@ export const Header: React.FC<HeaderProps> = ({
           {isAuthenticated && currentUser && activeRole ? (
             <>
               {/* Role Badge Indicator (Derived strictly from authenticated profile) */}
-              <div
-                className={`hidden sm:flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold shadow-xs ${
-                  roleLabels[activeRole]?.color || 'bg-slate-700 text-white'
-                }`}
-              >
-                {roleLabels[activeRole]?.icon}
-                <span>{roleLabels[activeRole]?.label}</span>
-              </div>
+              {(() => {
+                const badge = getEffectiveRoleBadge();
+                if (!badge) return null;
+                return (
+                  <div
+                    className={`hidden sm:flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold shadow-xs ${badge.color}`}
+                  >
+                    {badge.icon}
+                    <span>{badge.label}</span>
+                  </div>
+                );
+              })()}
 
               {/* Live Notifications Bell */}
               <div className="relative">

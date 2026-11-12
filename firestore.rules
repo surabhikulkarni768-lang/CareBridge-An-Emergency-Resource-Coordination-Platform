@@ -1,8 +1,6 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-
-    // Helper functions for Role-Based Access Control
     function isSignedIn() {
       return request.auth != null;
     }
@@ -11,10 +9,15 @@ service cloud.firestore {
       return isSignedIn() && request.auth.uid == userId;
     }
 
+    function userPath(userId) {
+      return /databases/$(database)/documents/users/$(userId);
+    }
+
     function getUserData() {
-      return isSignedIn() &&
-        exists(/databases/$(database)/documents/users/$(request.auth.uid))
-        ? get(/databases/$(database)/documents/users/$(request.auth.uid)).data
+      let uid = request.auth != null ? request.auth.uid : '';
+      let path = userPath(uid);
+      return isSignedIn() && exists(path)
+        ? get(path).data
         : {
             'role': null,
             'isActive': false,
@@ -24,8 +27,8 @@ service cloud.firestore {
 
     function isAdmin() {
       return isSignedIn() &&
-        ('role' in getUserData()) &&
-        getUserData().role == 'admin';
+        getUserData().get('role', '') == 'admin' &&
+        getUserData().get('isActive', false) == true;
     }
 
     function isProviderRole(role) {
@@ -36,110 +39,137 @@ service cloud.firestore {
         role == 'doctor';
     }
 
-    function hasAttendantConsent(caseData) {
-      return ('attendant' in caseData) &&
-        caseData.attendant is map &&
-        ('relation' in caseData.attendant) &&
-        (caseData.attendant.relation == 'Self' ||
-         (request.auth != null &&
-          ('attendantConsent' in caseData) &&
-          caseData.attendantConsent is map &&
-          ('granted' in caseData.attendantConsent) &&
-          ('givenByUid' in caseData.attendantConsent) &&
-          caseData.attendantConsent.granted == true &&
-          caseData.attendantConsent.givenByUid == request.auth.uid));
+    function isAttendantRole(role) {
+      return role == 'patientAttendant' ||
+        role == 'patient_attendant' ||
+        role == 'attendant';
     }
 
     function isAuthorizedPatient(patientUid) {
-      let userPath = /databases/$(database)/documents/users/$(patientUid);
+      let path = userPath(patientUid);
       return isSignedIn() &&
         request.auth.uid == patientUid &&
-        exists(userPath) &&
-        ('role' in get(userPath).data) &&
-        get(userPath).data.role == 'patient';
+        exists(path) &&
+        get(path).data.get('role', '') == 'patient' &&
+        get(path).data.get('isActive', false) == true;
+    }
+
+    function hasPatientLinkConsent(attendantUid, patientUid) {
+      let path = /databases/$(database)/documents/patientLinks/$(attendantUid + '_' + patientUid);
+      return isSignedIn() &&
+        exists(path) &&
+        get(path).data.get('attendantUid', '') == attendantUid &&
+        get(path).data.get('patientUid', '') == patientUid &&
+        get(path).data.get('consentGranted', false) == true &&
+        get(path).data.get('consentStatus', '') == 'granted';
     }
 
     function hasActiveAttendantConsent(patientUid) {
+      let attendantUid = request.auth != null ? request.auth.uid : '';
+      let path = /databases/$(database)/documents/users/$(patientUid)/attendants/$(attendantUid);
       return isSignedIn() &&
         patientUid is string &&
-        exists(/databases/$(database)/documents/users/$(patientUid)/attendants/$(request.auth.uid)) &&
-        get(/databases/$(database)/documents/users/$(patientUid)/attendants/$(request.auth.uid)).data.keys().hasAll([
-          'patientUid',
-          'attendantUid',
-          'activeConsent'
-        ]) &&
-        get(/databases/$(database)/documents/users/$(patientUid)/attendants/$(request.auth.uid)).data.patientUid == patientUid &&
-        get(/databases/$(database)/documents/users/$(patientUid)/attendants/$(request.auth.uid)).data.attendantUid == request.auth.uid &&
-        get(/databases/$(database)/documents/users/$(patientUid)/attendants/$(request.auth.uid)).data.activeConsent == true;
+        exists(path) &&
+        get(path).data.get('patientUid', '') == patientUid &&
+        get(path).data.get('attendantUid', '') == request.auth.uid &&
+        get(path).data.get('activeConsent', false) == true;
+    }
+
+    function isAuthorizedAttendantForPatient(patientUid) {
+      return isSignedIn() &&
+        isAttendantRole(getUserData().get('role', '')) &&
+        getUserData().get('isActive', false) == true &&
+        (hasPatientLinkConsent(request.auth.uid, patientUid) ||
+         hasActiveAttendantConsent(patientUid));
     }
 
     function hasAssignedRequest(caseId, resourceType) {
-      let requestPath = /databases/$(database)/documents/requests/$(('REQ-' + caseId) + '-' + resourceType);
-      return exists(requestPath) &&
-        ('providerUid' in get(requestPath).data) &&
-        get(requestPath).data.providerUid == request.auth.uid;
+      let path = /databases/$(database)/documents/requests/$(('REQ-' + caseId) + '-' + resourceType);
+      return isSignedIn() &&
+        exists(path) &&
+        get(path).data.get('providerUid', '') == request.auth.uid;
+    }
+
+    function providerIsVerifiedAndActive(providerUid) {
+      let directoryPath = /databases/$(database)/documents/providerDirectory/$(providerUid);
+      let profilePath = userPath(providerUid);
+      return exists(directoryPath) &&
+        exists(profilePath) &&
+        get(directoryPath).data.get('uid', '') == providerUid &&
+        get(directoryPath).data.get('isActive', false) == true &&
+        get(directoryPath).data.get('isVerified', false) == true &&
+        get(profilePath).data.get('isActive', false) == true &&
+        get(profilePath).data.get('isVerified', false) == true &&
+        get(directoryPath).data.get('role', '') == get(profilePath).data.get('role', '');
     }
 
     function isAssignedProvider(caseId) {
+      let role = getUserData().get('role', '');
+      let casePath = /databases/$(database)/documents/cases/$(caseId);
       return isSignedIn() &&
-        ('role' in getUserData()) &&
-        getUserData().role != null &&
+        isProviderRole(role) &&
+        exists(casePath) &&
+        providerIsVerifiedAndActive(request.auth.uid) &&
         (
-          (getUserData().role == 'hospital' &&
+          get(casePath).data.get('assignedHospitalUid', '') == request.auth.uid ||
+          get(casePath).data.get('assignedBloodBankUid', '') == request.auth.uid ||
+          get(casePath).data.get('assignedOxygenUid', '') == request.auth.uid ||
+          get(casePath).data.get('assignedAmbulanceUid', '') == request.auth.uid ||
+          (role == 'hospital' &&
            (hasAssignedRequest(caseId, 'bed') || hasAssignedRequest(caseId, 'icu'))) ||
-          (getUserData().role == 'bloodBank' && hasAssignedRequest(caseId, 'blood')) ||
-          (getUserData().role == 'oxygenProvider' && hasAssignedRequest(caseId, 'oxygen')) ||
-          (getUserData().role == 'ambulanceProvider' && hasAssignedRequest(caseId, 'ambulance')) ||
-          (getUserData().role == 'doctor' && hasAssignedRequest(caseId, 'doctor'))
+          (role == 'bloodBank' && hasAssignedRequest(caseId, 'blood')) ||
+          (role == 'oxygenProvider' && hasAssignedRequest(caseId, 'oxygen')) ||
+          (role == 'ambulanceProvider' && hasAssignedRequest(caseId, 'ambulance')) ||
+          (role == 'doctor' && hasAssignedRequest(caseId, 'doctor'))
         );
     }
 
     function providerCanReceiveResourceRequest(providerUid, resourceType) {
       let directoryPath = /databases/$(database)/documents/providerDirectory/$(providerUid);
-      let userPath = /databases/$(database)/documents/users/$(providerUid);
-      let provider = get(directoryPath).data;
-      let providerUser = get(userPath).data;
-      return provider.keys().hasAll(['role', 'isActive', 'isVerified']) &&
-        providerUser.keys().hasAll(['role', 'isActive', 'isVerified']) &&
-        provider.isActive == true &&
-        provider.isVerified == true &&
-        providerUser.isActive == true &&
-        providerUser.isVerified == true &&
-        provider.role == providerUser.role &&
+      let profilePath = userPath(providerUid);
+      return exists(directoryPath) &&
+        exists(profilePath) &&
+        get(directoryPath).data.get('uid', '') == providerUid &&
+        get(directoryPath).data.get('isActive', false) == true &&
+        get(directoryPath).data.get('isVerified', false) == true &&
+        get(profilePath).data.get('isActive', false) == true &&
+        get(profilePath).data.get('isVerified', false) == true &&
+        get(directoryPath).data.get('role', '') == get(profilePath).data.get('role', '') &&
         (
-          ((resourceType == 'bed' || resourceType == 'icu') && provider.role == 'hospital') ||
-          (resourceType == 'blood' && provider.role == 'bloodBank') ||
-          (resourceType == 'oxygen' && provider.role == 'oxygenProvider') ||
-          (resourceType == 'ambulance' && provider.role == 'ambulanceProvider') ||
-          (resourceType == 'doctor' && provider.role == 'doctor')
+          ((resourceType == 'bed' || resourceType == 'icu') && get(profilePath).data.get('role', '') == 'hospital') ||
+          (resourceType == 'blood' && get(profilePath).data.get('role', '') == 'bloodBank') ||
+          (resourceType == 'oxygen' && get(profilePath).data.get('role', '') == 'oxygenProvider') ||
+          (resourceType == 'ambulance' && get(profilePath).data.get('role', '') == 'ambulanceProvider') ||
+          (resourceType == 'doctor' && get(profilePath).data.get('role', '') == 'doctor')
         );
     }
 
     function canReceiveResourceRequest(providerUid, resourceType) {
       let directoryPath = /databases/$(database)/documents/providerDirectory/$(providerUid);
-      let userPath = /databases/$(database)/documents/users/$(providerUid);
+      let profilePath = userPath(providerUid);
       return exists(directoryPath) &&
-        exists(userPath) &&
+        exists(profilePath) &&
         providerCanReceiveResourceRequest(providerUid, resourceType);
     }
 
-    function isProvider() {
-      return isSignedIn() &&
-        ('role' in getUserData()) &&
-        (
-        getUserData().role == 'hospital' ||
-        getUserData().role == 'bloodBank' ||
-        getUserData().role == 'oxygenProvider' ||
-        getUserData().role == 'ambulanceProvider' ||
-        getUserData().role == 'doctor'
-      );
+    function canSubmitForPatient(patientUid) {
+      return isAuthorizedPatient(patientUid) ||
+        isAuthorizedAttendantForPatient(patientUid);
     }
 
-    // Users Collection: users can read and edit their own doc, admins can read/manage all
+    function canReadCase(caseData) {
+      let patientUid = caseData.get('patientUid', '');
+      return isAdmin() ||
+        (isSignedIn() && patientUid == request.auth.uid) ||
+        isAuthorizedAttendantForPatient(patientUid) ||
+        isAssignedProvider(caseData.get('caseId', ''));
+    }
+
     match /users/{userId} {
-      allow read: if isOwner(userId) || isAdmin();
+      allow get: if isOwner(userId) || isAdmin();
+      allow list: if isAdmin();
       allow create: if isOwner(userId) &&
-        request.resource.data.keys().hasAll(['uid', 'role', 'isVerified']) &&
+        request.resource.data.keys().hasAll(['uid', 'role', 'isVerified', 'isActive']) &&
         request.resource.data.uid == userId &&
         request.resource.data.role != 'admin' &&
         (!isProviderRole(request.resource.data.role) || request.resource.data.isVerified == false);
@@ -156,35 +186,30 @@ service cloud.firestore {
            'hospitalAffiliation'
          ]) &&
          request.resource.data.role == resource.data.role &&
-         request.resource.data.isVerified == resource.data.isVerified);
+         request.resource.data.isVerified == resource.data.isVerified &&
+         request.resource.data.isActive == resource.data.isActive);
       allow delete: if isAdmin();
 
       match /attendants/{attendantUid} {
-        allow read: if isOwner(userId) ||
+        allow get: if isOwner(userId) ||
           (isSignedIn() &&
            request.auth.uid == attendantUid &&
-           resource.data.keys().hasAll(['attendantUid', 'activeConsent']) &&
-           resource.data.attendantUid == request.auth.uid &&
-           resource.data.activeConsent == true);
+           resource.data.get('attendantUid', '') == request.auth.uid &&
+           resource.data.get('activeConsent', false) == true);
+        allow list: if isOwner(userId) || isAdmin();
         allow create: if isAuthorizedPatient(userId) &&
-          request.resource.data.keys().hasAll([
-            'patientUid',
-            'attendantUid',
-            'activeConsent'
-          ]) &&
+          request.resource.data.keys().hasAll(['patientUid', 'attendantUid', 'activeConsent']) &&
           request.resource.data.patientUid == userId &&
           request.resource.data.attendantUid == attendantUid &&
           request.resource.data.activeConsent == true &&
           attendantUid != userId &&
-          exists(/databases/$(database)/documents/users/$(attendantUid)) &&
-          get(/databases/$(database)/documents/users/$(attendantUid)).data.role == 'patient';
+          exists(userPath(attendantUid)) &&
+          isAttendantRole(get(userPath(attendantUid)).data.get('role', ''));
         allow update: if isAuthorizedPatient(userId) &&
-          resource.data.keys().hasAll(['patientUid', 'attendantUid']) &&
-          request.resource.data.keys().hasAll(['patientUid', 'attendantUid']) &&
-          resource.data.patientUid == userId &&
-          resource.data.attendantUid == attendantUid &&
-          request.resource.data.patientUid == userId &&
-          request.resource.data.attendantUid == attendantUid &&
+          resource.data.get('patientUid', '') == userId &&
+          resource.data.get('attendantUid', '') == attendantUid &&
+          request.resource.data.get('patientUid', '') == userId &&
+          request.resource.data.get('attendantUid', '') == attendantUid &&
           request.resource.data.diff(resource.data).affectedKeys().hasOnly([
             'activeConsent',
             'grantedAt',
@@ -200,73 +225,116 @@ service cloud.firestore {
         resource.data.get('activeConsent', false) == true;
     }
 
-    // Stores a minimal public directory record rather than exposing private user documents.
+    match /patientLinks/{linkId} {
+      allow get: if isAdmin() ||
+        (isSignedIn() &&
+         (resource.data.get('attendantUid', '') == request.auth.uid ||
+          resource.data.get('patientUid', '') == request.auth.uid));
+      allow list: if isAdmin() ||
+        (isSignedIn() && resource.data.get('attendantUid', '') == request.auth.uid);
+      allow create: if isSignedIn() &&
+        request.resource.data.keys().hasAll([
+          'attendantUid',
+          'patientUid',
+          'consentGranted',
+          'consentStatus'
+        ]) &&
+        request.resource.data.attendantUid is string &&
+        request.resource.data.patientUid is string &&
+        linkId == request.resource.data.attendantUid + '_' + request.resource.data.patientUid &&
+        (request.auth.uid == request.resource.data.patientUid || isAdmin()) &&
+        request.resource.data.consentGranted == true &&
+        request.resource.data.consentStatus == 'granted';
+      allow update: if isAdmin() ||
+        (isOwner(resource.data.get('patientUid', '')) &&
+         request.resource.data.get('attendantUid', '') == resource.data.get('attendantUid', '') &&
+         request.resource.data.get('patientUid', '') == resource.data.get('patientUid', '') &&
+         request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+           'consentGranted',
+           'consentStatus',
+           'consentDate',
+           'updatedAt'
+         ]));
+      allow delete: if isAdmin() || isOwner(resource.data.get('patientUid', ''));
+    }
+
     match /providerDirectory/{providerUid} {
       allow read: if isSignedIn();
-      allow create: if isAdmin() ||
+      allow create, update: if isAdmin() ||
         (isOwner(providerUid) &&
-         getUserData().keys().hasAll(['role', 'isVerified', 'isActive']) &&
-         request.resource.data.uid == providerUid &&
-         isProviderRole(getUserData().role) &&
-         request.resource.data.role == getUserData().role &&
-         request.resource.data.isVerified == getUserData().isVerified &&
-         request.resource.data.isActive == getUserData().isActive);
-      allow update: if isAdmin() ||
-        (isOwner(providerUid) &&
-         getUserData().keys().hasAll(['role', 'isVerified', 'isActive']) &&
-         request.resource.data.uid == providerUid &&
-         request.resource.data.role == resource.data.role &&
-         request.resource.data.isVerified == resource.data.isVerified &&
-         request.resource.data.isVerified == getUserData().isVerified &&
-         request.resource.data.isActive == getUserData().isActive);
+         isProviderRole(getUserData().get('role', '')) &&
+         request.resource.data.get('uid', '') == providerUid &&
+         request.resource.data.get('role', '') == getUserData().get('role', '') &&
+         request.resource.data.get('isVerified', false) == getUserData().get('isVerified', false) &&
+         request.resource.data.get('isActive', false) == getUserData().get('isActive', false));
       allow delete: if isAdmin();
     }
 
-    // Emergency Cases: Patients, linked attendants, assigned providers, and admins can read
     match /cases/{caseId} {
       allow get: if isSignedIn() &&
         (!exists(/databases/$(database)/documents/cases/$(caseId)) ||
-         isAdmin() ||
-         (('patientUid' in resource.data) &&
-          (isOwner(resource.data.patientUid) ||
-           hasActiveAttendantConsent(resource.data.patientUid))) ||
-         isAssignedProvider(caseId));
-      allow list: if isSignedIn() &&
-        (isAdmin() ||
-         (('patientUid' in resource.data) &&
-          (isOwner(resource.data.patientUid) ||
-           hasActiveAttendantConsent(resource.data.patientUid))) ||
-         isAssignedProvider(caseId));
-      allow create: if request.resource.data.keys().hasAll([
-          'patientUid',
-          'caseId',
-          'attendant'
-        ]) &&
-        isAuthorizedPatient(request.resource.data.patientUid) &&
-        request.resource.data.caseId == caseId &&
-        hasAttendantConsent(request.resource.data);
+         canReadCase(resource.data));
+      allow list: if isSignedIn() && canReadCase(resource.data);
+      allow create: if isAdmin() ||
+        (request.resource.data.get('caseId', '') == caseId &&
+         canSubmitForPatient(request.resource.data.get('patientUid', '')) &&
+         (isAuthorizedPatient(request.resource.data.get('patientUid', '')) ||
+          (request.resource.data.get('requesterUid', '') == request.auth.uid &&
+           (request.resource.data.get('attendantUid', '') == request.auth.uid ||
+            request.resource.data.get('attendant', {}).get('uid', '') == request.auth.uid))));
       allow update: if isAdmin() ||
-        (('patientUid' in resource.data) &&
-         isOwner(resource.data.patientUid) &&
-         request.resource.data.keys().hasAll(['patientUid', 'status']) &&
-         request.resource.data.patientUid == resource.data.patientUid &&
+        (resource.data.get('patientUid', '') == request.auth.uid &&
+         request.resource.data.get('patientUid', '') == resource.data.get('patientUid', '') &&
          request.resource.data.diff(resource.data).affectedKeys().hasOnly([
            'status',
-           'updatedAt'
-         ]) &&
-         request.resource.data.status in ['active', 'resolved', 'cancelled']);
+           'updatedAt',
+           'auditHistory',
+           'cancellationReason'
+         ])) ||
+        (isAuthorizedAttendantForPatient(resource.data.get('patientUid', '')) &&
+         resource.data.get('attendantUid', '') == request.auth.uid &&
+         request.resource.data.get('patientUid', '') == resource.data.get('patientUid', '') &&
+         request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+           'status',
+           'updatedAt',
+           'auditHistory',
+           'cancellationReason'
+         ])) ||
+        (isAssignedProvider(caseId) &&
+         request.resource.data.get('patientUid', '') == resource.data.get('patientUid', '') &&
+         request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+           'status',
+           'updatedAt',
+           'serviceStatuses',
+           'auditHistory',
+           'assignedHospitalUid',
+           'assignedHospitalName',
+           'assignedBloodBankUid',
+           'assignedBloodBankName',
+           'assignedOxygenUid',
+           'assignedOxygenName',
+           'assignedAmbulanceUid',
+           'assignedAmbulanceName',
+           'estimatedResponseMinutes'
+         ]));
       allow delete: if isAdmin();
     }
 
-    // Resource Requests: Patients, linked attendants, recipient providers, and admins can access
     match /requests/{requestId} {
-      allow read: if isSignedIn() &&
+      allow get: if isSignedIn() &&
         (isAdmin() ||
-         (resource.data.keys().hasAll(['patientUid', 'providerUid']) &&
-          (isOwner(resource.data.patientUid) ||
-           hasActiveAttendantConsent(resource.data.patientUid) ||
-           resource.data.providerUid == request.auth.uid)));
-      allow create: if request.resource.data.keys().hasAll([
+         resource.data.get('patientUid', '') == request.auth.uid ||
+         isAuthorizedAttendantForPatient(resource.data.get('patientUid', '')) ||
+         (resource.data.get('providerUid', '') == request.auth.uid &&
+          providerIsVerifiedAndActive(request.auth.uid)));
+      allow list: if isSignedIn() &&
+        (isAdmin() ||
+         resource.data.get('patientUid', '') == request.auth.uid ||
+         isAuthorizedAttendantForPatient(resource.data.get('patientUid', '')) ||
+         (resource.data.get('providerUid', '') == request.auth.uid &&
+          providerIsVerifiedAndActive(request.auth.uid)));
+      allow create: if isSignedIn() &&
+        request.resource.data.keys().hasAll([
           'patientUid',
           'requesterUid',
           'caseId',
@@ -274,19 +342,35 @@ service cloud.firestore {
           'providerUid',
           'status'
         ]) &&
-        isAuthorizedPatient(request.resource.data.patientUid) &&
-        request.resource.data.patientUid == request.auth.uid &&
-        request.resource.data.requesterUid == request.auth.uid &&
-        request.resource.data.status == 'pending' &&
+        request.resource.data.get('requesterUid', '') == request.auth.uid &&
+        request.resource.data.get('status', '') == 'pending' &&
         existsAfter(/databases/$(database)/documents/cases/$(request.resource.data.caseId)) &&
-        getAfter(/databases/$(database)/documents/cases/$(request.resource.data.caseId)).data.patientUid == request.auth.uid &&
-        hasAttendantConsent(getAfter(/databases/$(database)/documents/cases/$(request.resource.data.caseId)).data) &&
-        canReceiveResourceRequest(request.resource.data.providerUid, request.resource.data.resourceType);
-      allow update: if isSignedIn();
+        getAfter(/databases/$(database)/documents/cases/$(request.resource.data.caseId)).data.get('patientUid', '') ==
+          request.resource.data.get('patientUid', '') &&
+        getAfter(/databases/$(database)/documents/cases/$(request.resource.data.caseId)).data.get('requesterUid', '') ==
+          request.auth.uid &&
+        canSubmitForPatient(request.resource.data.get('patientUid', '')) &&
+        canReceiveResourceRequest(
+          request.resource.data.get('providerUid', ''),
+          request.resource.data.get('resourceType', '')
+        );
+      allow update: if isAdmin() ||
+        (resource.data.get('providerUid', '') == request.auth.uid &&
+         providerIsVerifiedAndActive(request.auth.uid) &&
+         request.resource.data.get('providerUid', '') == resource.data.get('providerUid', '') &&
+         request.resource.data.get('patientUid', '') == resource.data.get('patientUid', '') &&
+         request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+           'status',
+           'updatedAt',
+           'respondedAt',
+           'rejectionReason'
+         ])) ||
+        (resource.data.get('patientUid', '') == request.auth.uid &&
+         request.resource.data.get('patientUid', '') == resource.data.get('patientUid', '') &&
+         request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt']));
       allow delete: if isAdmin();
     }
 
-    // Provider Specific Profiles: Publicly readable for authenticated users (search/directory)
     match /hospitalProfiles/{uid} {
       allow read: if isSignedIn();
       allow write: if isOwner(uid) || isAdmin();
@@ -307,19 +391,17 @@ service cloud.firestore {
       allow write: if isOwner(uid) || isAdmin();
     }
 
-    // Ambulance Trips: Tracked during emergency dispatch
     match /ambulanceTrips/{tripId} {
       allow read, write: if isSignedIn();
     }
 
-    // Notifications: Recipient can read/update read state
     match /notifications/{notifId} {
-      allow read, update: if isSignedIn() && resource.data.recipientUid == request.auth.uid;
+      allow read, update: if isSignedIn() &&
+        resource.data.get('recipientUid', '') == request.auth.uid;
       allow create: if isSignedIn();
       allow delete: if isAdmin();
     }
 
-    // Clinical Notes: Recorded by attending physicians
     match /clinicalNotes/{noteId} {
       allow read, write: if isSignedIn();
     }

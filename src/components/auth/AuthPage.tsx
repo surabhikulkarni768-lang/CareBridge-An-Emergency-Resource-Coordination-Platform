@@ -53,7 +53,7 @@ export const AuthPage: React.FC<AuthPageProps> = ({
   const [phone, setPhone] = useState('');
   const [signupPassword, setSignupPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
-  const [selectedRole, setSelectedRole] = useState<Exclude<UserRole, 'admin'>>('patient');
+  const [selectedRole, setSelectedRole] = useState<Exclude<UserRole, 'admin'>>('patientAttendant');
   const [hospitalAffiliation, setHospitalAffiliation] = useState('');
   const [agreeTerms, setAgreeTerms] = useState(false);
 
@@ -67,8 +67,14 @@ export const AuthPage: React.FC<AuthPageProps> = ({
     icon: React.ReactNode;
   }> = [
     {
+      role: 'patientAttendant',
+      title: 'Patient Attendant',
+      description: 'Assist patients & family with hospital bed, blood, oxygen, and ambulance dispatch',
+      icon: <User className="w-5 h-5 text-teal-600" />
+    },
+    {
       role: 'patient',
-      title: 'Patient / Attendant',
+      title: 'Patient (Self)',
       description: 'Request beds, blood, oxygen, or ambulances during an emergency',
       icon: <User className="w-5 h-5 text-teal-600" />
     },
