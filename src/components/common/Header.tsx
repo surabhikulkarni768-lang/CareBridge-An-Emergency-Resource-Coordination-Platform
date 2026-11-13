@@ -10,11 +10,25 @@ import {
   Wind,
   Truck,
   Stethoscope,
-  ChevronDown
+  ChevronDown,
+  Settings2
 } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
-import { dataStore } from '../../services/dataService';
+import {
+  markAllNotificationsReadInFirestore,
+  markNotificationReadInFirestore,
+  subscribeNotificationsForUserFromFirestore
+} from '../../services/dataService';
 import { NotificationPanel } from './NotificationPanel';
+import { PushNotificationSettings } from './PushNotificationSettings';
+import {
+  DEFAULT_PUSH_PREFERENCES,
+  disablePushNotifications,
+  enablePushNotificationsAfterConsent,
+  subscribeToPushNotificationPreferences,
+  updatePushNotificationPreferences,
+  type PushNotificationPreferences
+} from '../../services/pushNotificationService';
 import type { NotificationItem, UserRole } from '../../types';
 
 interface HeaderProps {
@@ -31,19 +45,102 @@ export const Header: React.FC<HeaderProps> = ({
   const { currentUser, activeRole, logout, isAuthenticated } = useAuth();
   const [notifications, setNotifications] = useState<NotificationItem[]>([]);
   const [isNotifOpen, setIsNotifOpen] = useState(false);
+  const [notificationError, setNotificationError] = useState<string | null>(null);
+  const [pushPreferences, setPushPreferences] = useState<PushNotificationPreferences>(DEFAULT_PUSH_PREFERENCES);
+  const [isPushSettingsOpen, setIsPushSettingsOpen] = useState(false);
+  const [pushSettingsError, setPushSettingsError] = useState<string | null>(null);
+  const [isPushSettingsBusy, setIsPushSettingsBusy] = useState(false);
 
   useEffect(() => {
     if (!currentUser) {
       setNotifications([]);
+      setNotificationError(null);
+      setPushPreferences(DEFAULT_PUSH_PREFERENCES);
+      setPushSettingsError(null);
       return;
     }
-    const update = () => {
-      setNotifications(dataStore.getNotifications(currentUser.uid));
-    };
-    update();
-    const unsub = dataStore.subscribe(update);
-    return () => unsub();
+    return subscribeNotificationsForUserFromFirestore(
+      currentUser.uid,
+      (items) => {
+        setNotifications(items);
+        setNotificationError(null);
+      },
+      setNotificationError
+    );
   }, [currentUser]);
+
+  useEffect(() => {
+    if (!currentUser) return;
+    return subscribeToPushNotificationPreferences(
+      currentUser.uid,
+      setPushPreferences,
+      setPushSettingsError
+    );
+  }, [currentUser]);
+
+  const enablePush = async () => {
+    if (!currentUser) return;
+    setIsPushSettingsBusy(true);
+    setPushSettingsError(null);
+    try {
+      setPushPreferences(await enablePushNotificationsAfterConsent(currentUser.uid));
+    } catch (error) {
+      setPushSettingsError(error instanceof Error ? error.message : 'Browser alerts could not be enabled.');
+    } finally {
+      setIsPushSettingsBusy(false);
+    }
+  };
+
+  const disablePush = async () => {
+    if (!currentUser) return;
+    setIsPushSettingsBusy(true);
+    setPushSettingsError(null);
+    try {
+      await disablePushNotifications(currentUser.uid);
+      setPushPreferences(DEFAULT_PUSH_PREFERENCES);
+    } catch (error) {
+      setPushSettingsError(error instanceof Error ? error.message : 'Browser alerts could not be disabled.');
+    } finally {
+      setIsPushSettingsBusy(false);
+    }
+  };
+
+  const changePushPreference = async (
+    key: 'emergencyStatus' | 'requestAssignments' | 'providerResponses',
+    value: boolean
+  ) => {
+    if (!currentUser) return;
+    const updated = { ...pushPreferences, [key]: value };
+    setIsPushSettingsBusy(true);
+    setPushSettingsError(null);
+    try {
+      await updatePushNotificationPreferences(currentUser.uid, updated);
+      setPushPreferences(updated);
+    } catch (error) {
+      setPushSettingsError(error instanceof Error ? error.message : 'Notification preference could not be saved.');
+    } finally {
+      setIsPushSettingsBusy(false);
+    }
+  };
+
+  const markRead = async (id: string) => {
+    try {
+      await markNotificationReadInFirestore(id);
+      setNotificationError(null);
+    } catch (error) {
+      setNotificationError(error instanceof Error ? error.message : 'Notification could not be marked as read.');
+    }
+  };
+
+  const markAllRead = async () => {
+    if (!currentUser) return;
+    try {
+      await markAllNotificationsReadInFirestore(currentUser.uid);
+      setNotificationError(null);
+    } catch (error) {
+      setNotificationError(error instanceof Error ? error.message : 'Notifications could not be marked as read.');
+    }
+  };
 
   const unreadCount = notifications.filter((n) => !n.isRead).length;
 
@@ -130,9 +227,31 @@ export const Header: React.FC<HeaderProps> = ({
                   notifications={notifications}
                   isOpen={isNotifOpen}
                   onClose={() => setIsNotifOpen(false)}
-                  onMarkRead={(id) => dataStore.markNotificationAsRead(id)}
-                  onMarkAllRead={() => dataStore.markAllNotificationsAsRead(currentUser.uid)}
+                  onMarkRead={(id) => void markRead(id)}
+                  onMarkAllRead={() => void markAllRead()}
+                  error={notificationError}
                 />
+              </div>
+              <div className="relative">
+                <button
+                  type="button"
+                  onClick={() => setIsPushSettingsOpen(!isPushSettingsOpen)}
+                  className="rounded-lg p-2 text-slate-600 transition-colors hover:bg-slate-100 hover:text-slate-900"
+                  title="Push notification settings"
+                  aria-label="Push notification settings"
+                >
+                  <Settings2 className="h-5 w-5" />
+                </button>
+                {isPushSettingsOpen && (
+                  <PushNotificationSettings
+                    preferences={pushPreferences}
+                    error={pushSettingsError}
+                    busy={isPushSettingsBusy}
+                    onEnable={() => void enablePush()}
+                    onDisable={() => void disablePush()}
+                    onPreferenceChange={(key, value) => void changePushPreference(key, value)}
+                  />
+                )}
               </div>
 
               {/* User Profile Pill & Secure Sign Out */}

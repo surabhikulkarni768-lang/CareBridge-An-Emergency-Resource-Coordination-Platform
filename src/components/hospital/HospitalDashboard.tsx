@@ -19,17 +19,20 @@ import {
 } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
 import { dataStore, respondToRequestInFirestore, subscribeRequestsForProviderFromFirestore } from '../../services/dataService';
-import type { HospitalProfile, ResourceRequest, EmergencyCase } from '../../types';
+import { ProviderRequestsPanel } from '../common/ProviderRequestsPanel';
+import type { HospitalProfile, ResourceRequest } from '../../types';
 
 export const HospitalDashboard: React.FC = () => {
   const { currentUser } = useAuth();
   const [profile, setProfile] = useState<HospitalProfile | null>(null);
   const [requests, setRequests] = useState<ResourceRequest[]>([]);
-  const [cases, setCases] = useState<EmergencyCase[]>([]);
+  const [requestsLoading, setRequestsLoading] = useState(true);
+  const [requestsError, setRequestsError] = useState<string | null>(null);
   const [filter, setFilter] = useState<'all' | 'pending' | 'accepted' | 'rejected'>('pending');
   const [rejectingReqId, setRejectingReqId] = useState<string | null>(null);
-  const [rejectionReason, setRejectionReason] = useState<string>('No ICU bed currently vacant');
+  const [rejectionReason, setRejectionReason] = useState<string>('');
   const [isUpdating, setIsUpdating] = useState(false);
+  const [respondingReqId, setRespondingReqId] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
 
   // Edit bed counts state
@@ -46,14 +49,25 @@ export const HospitalDashboard: React.FC = () => {
       setAvailICU(prof.availableICU);
       setAvailVentilators(prof.availableVentilators);
     }
-    setCases(dataStore.getCases());
   };
 
   useEffect(() => {
     if (!currentUser) return;
     loadData();
     const unsubscribeStore = dataStore.subscribe(loadData);
-    const unsubscribeRequests = subscribeRequestsForProviderFromFirestore(currentUser.uid, setRequests);
+    const unsubscribeRequests = subscribeRequestsForProviderFromFirestore(
+      currentUser.uid,
+      (nextRequests) => {
+        setRequests(nextRequests);
+        setRequestsLoading(false);
+        setRequestsError(null);
+      },
+      (message) => {
+        setRequests([]);
+        setRequestsError(message);
+        setRequestsLoading(false);
+      }
+    );
     return () => {
       unsubscribeStore();
       unsubscribeRequests();
@@ -76,23 +90,38 @@ export const HospitalDashboard: React.FC = () => {
   };
 
   const handleAccept = async (reqId: string) => {
+    setRespondingReqId(reqId);
     try {
-      await respondToRequestInFirestore(reqId, 'accepted');
-      setSuccessMessage('Admission request accepted. Bed allocated & patient notified.');
+      const coordinatorNotified = await respondToRequestInFirestore(reqId, 'accepted');
+      setSuccessMessage(coordinatorNotified
+        ? 'Admission request accepted. The coordinator was notified.'
+        : 'Admission request accepted. The status is visible in the coordinator live request list.');
       setTimeout(() => setSuccessMessage(null), 3000);
     } catch (error) {
       window.alert(error instanceof Error ? error.message : 'Could not respond to the request.');
+    } finally {
+      setRespondingReqId(null);
     }
   };
 
   const handleReject = async (reqId: string) => {
+    if (rejectionReason.trim().length < 5) {
+      window.alert('Enter a rejection reason of at least five characters.');
+      return;
+    }
+    setRespondingReqId(reqId);
     try {
-      await respondToRequestInFirestore(reqId, 'rejected', rejectionReason);
+      const coordinatorNotified = await respondToRequestInFirestore(reqId, 'rejected', rejectionReason.trim());
       setRejectingReqId(null);
-      setSuccessMessage('Admission request rejected. Reason logged & patient notified.');
+      setRejectionReason('');
+      setSuccessMessage(coordinatorNotified
+        ? 'Admission request rejected. The coordinator was notified.'
+        : 'Admission request rejected. The status is visible in the coordinator live request list.');
       setTimeout(() => setSuccessMessage(null), 3000);
     } catch (error) {
       window.alert(error instanceof Error ? error.message : 'Could not respond to the request.');
+    } finally {
+      setRespondingReqId(null);
     }
   };
 
@@ -107,7 +136,13 @@ export const HospitalDashboard: React.FC = () => {
   const pendingCount = requests.filter((r) => isActionRequired(r.status)).length;
 
   if (!profile) {
-    return <div className="p-8 text-center text-slate-500">Loading Hospital Provider Dashboard...</div>;
+    return (
+      <div className="max-w-7xl mx-auto p-8 space-y-4 text-center text-slate-500">
+        Loading Hospital Provider Dashboard...
+        {requestsError && <p role="alert" className="text-sm text-red-700">{requestsError}</p>}
+        {currentUser && <ProviderRequestsPanel providerUid={currentUser.uid} title="Assigned Hospital Requests" />}
+      </div>
+    );
   }
 
   return (
@@ -297,7 +332,11 @@ export const HospitalDashboard: React.FC = () => {
             </div>
 
             {/* Requests List */}
-            {filteredRequests.length === 0 ? (
+            {requestsError ? (
+              <div role="alert" className="rounded-lg border border-red-200 bg-red-50 p-3 text-xs text-red-800">{requestsError}</div>
+            ) : requestsLoading ? (
+              <div className="py-8 text-center text-slate-500 text-xs">Loading assigned hospital requests...</div>
+            ) : filteredRequests.length === 0 ? (
               <div className="py-12 text-center text-slate-400 space-y-2">
                 <Bed className="w-10 h-10 mx-auto text-slate-300 opacity-60" />
                 <p className="text-xs font-medium">No admission requests matching filter "{filter}".</p>
@@ -305,7 +344,6 @@ export const HospitalDashboard: React.FC = () => {
             ) : (
               <div className="space-y-3">
                 {filteredRequests.map((req) => {
-                  const linkedCase = cases.find((c) => c.caseId === req.caseId);
                   return (
                     <div
                       key={req.requestId}
@@ -320,21 +358,24 @@ export const HospitalDashboard: React.FC = () => {
                             <span className="font-mono text-[11px] bg-slate-200 text-slate-700 px-1.5 py-0.5 rounded">
                               {req.caseId}
                             </span>
-                            {linkedCase && (
+                            {req.details.urgency && (
                               <span
                                 className={`text-[10px] font-bold uppercase px-2 py-0.5 rounded-full ${
-                                  linkedCase.urgencyLevel === 'immediate'
+                                  req.details.urgency === 'immediate'
                                     ? 'bg-red-100 text-red-700'
                                     : 'bg-orange-100 text-orange-700'
                                 }`}
                               >
-                                {linkedCase.urgencyLevel}
+                                {req.details.urgency}
                               </span>
                             )}
                           </div>
                           <p className="text-xs text-slate-600 mt-1">
                             Requested: <span className="font-semibold text-slate-800">{req.details.bedType || 'General Bed'}</span>
-                            {req.details.notes && ` — "${req.details.notes}"`}
+                            {req.details.notes && ` - "${req.details.notes}"`}
+                          </p>
+                          <p className="mt-1 text-[11px] text-slate-500">
+                            Assigned: {new Date(req.assignedAt || req.createdAt).toLocaleString()}
                           </p>
                         </div>
 
@@ -347,7 +388,7 @@ export const HospitalDashboard: React.FC = () => {
                           )}
                           {req.status === 'accepted' && (
                             <span className="inline-flex items-center gap-1 text-xs font-bold text-emerald-700 bg-emerald-100 px-2.5 py-1 rounded-full">
-                              <CheckCircle2 className="w-3.5 h-3.5" /> Admitted / Bed Reserved
+                              <CheckCircle2 className="w-3.5 h-3.5" /> Accepted
                             </span>
                           )}
                           {req.status === 'rejected' && (
@@ -355,40 +396,34 @@ export const HospitalDashboard: React.FC = () => {
                               <XCircle className="w-3.5 h-3.5" /> Declined
                             </span>
                           )}
+                          {req.respondedAt && (
+                            <p className="mt-1 text-[11px] text-slate-500">
+                              Response {new Date(req.respondedAt).toLocaleString()} by {req.respondedByUid || 'provider'}
+                              {req.responseDetails ? ` - ${req.responseDetails}` : ''}
+                            </p>
+                          )}
                         </div>
                       </div>
-
-                      {/* Clinical Summary */}
-                      {linkedCase && (
-                        <div className="p-3 bg-white rounded-lg border border-slate-100 text-xs text-slate-700 space-y-1">
-                          <div className="font-semibold text-slate-800 flex items-center gap-1">
-                            <Activity className="w-3.5 h-3.5 text-teal-600" /> Patient Presentation:
-                          </div>
-                          <p className="text-slate-600 italic">{linkedCase.conditionSummary}</p>
-                          <div className="flex flex-wrap gap-x-4 gap-y-1 pt-1 text-[11px] text-slate-500">
-                            <span>Age/Sex: {linkedCase.patientAge} / {linkedCase.patientGender}</span>
-                            <span>Location: {linkedCase.location?.address || linkedCase.incidentAddress || 'Not provided'}</span>
-                            {linkedCase.attendant && (
-                              <span>Attendant: {linkedCase.attendant.name} ({linkedCase.attendant.phone})</span>
-                            )}
-                          </div>
-                        </div>
-                      )}
 
                       {/* Action Buttons for Pending */}
                       {isActionRequired(req.status) && (
                         <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-200">
                           <button
-                            onClick={() => setRejectingReqId(req.requestId)}
+                            disabled={respondingReqId !== null}
+                            onClick={() => {
+                              setRejectionReason('');
+                              setRejectingReqId(req.requestId);
+                            }}
                             className="px-3.5 py-1.5 text-xs font-bold text-red-600 hover:bg-red-50 rounded-lg transition-colors border border-red-200"
                           >
                             Decline Admission
                           </button>
                           <button
+                            disabled={respondingReqId !== null}
                             onClick={() => handleAccept(req.requestId)}
                             className="px-4 py-1.5 text-xs font-bold text-white bg-blue-600 hover:bg-blue-700 rounded-lg shadow-xs transition-colors flex items-center gap-1.5"
                           >
-                            <CheckCircle2 className="w-3.5 h-3.5" /> Accept & Reserve Bed
+                            <CheckCircle2 className="w-3.5 h-3.5" /> Accept Request
                           </button>
                         </div>
                       )}
@@ -399,26 +434,27 @@ export const HospitalDashboard: React.FC = () => {
                           <label className="text-xs font-bold text-red-800 block">
                             Specify Reason for Declining Admission:
                           </label>
-                          <select
+                          <textarea
+                            required
+                            minLength={5}
                             value={rejectionReason}
-                            onChange={(e) => setRejectionReason(e.target.value)}
-                            className="w-full text-xs p-2 bg-white border border-red-300 rounded-lg text-slate-800 font-medium"
-                          >
-                            <option value="No ICU bed currently vacant">No ICU bed currently vacant</option>
-                            <option value="Specialist on-call surgery full">Specialist on-call surgery full</option>
-                            <option value="No ventilator available">No ventilator available</option>
-                            <option value="Re-routed to nearby trauma center">Re-routed to nearby trauma center</option>
-                          </select>
+                            onChange={(event) => setRejectionReason(event.target.value)}
+                            placeholder="Enter reason for declining (required)"
+                            className="w-full text-xs p-2 bg-white border border-red-300 rounded-lg text-slate-800"
+                          />
                           <div className="flex justify-end gap-2 pt-1">
                             <button
+                              type="button"
                               onClick={() => setRejectingReqId(null)}
                               className="px-3 py-1 text-xs text-slate-600 font-medium hover:bg-slate-200 rounded"
                             >
                               Cancel
                             </button>
                             <button
+                              type="button"
+                              disabled={respondingReqId !== null}
                               onClick={() => handleReject(req.requestId)}
-                              className="px-3 py-1 text-xs bg-red-600 text-white font-bold rounded shadow-xs"
+                              className="px-3 py-1 text-xs bg-red-600 text-white font-bold rounded shadow-xs disabled:opacity-50"
                             >
                               Confirm Rejection
                             </button>

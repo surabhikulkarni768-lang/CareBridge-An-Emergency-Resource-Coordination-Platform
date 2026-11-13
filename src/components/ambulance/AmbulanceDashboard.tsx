@@ -16,14 +16,21 @@ import {
 } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
 import { dataStore, respondToRequestInFirestore, subscribeRequestsForProviderFromFirestore } from '../../services/dataService';
+import { ProviderRequestsPanel } from '../common/ProviderRequestsPanel';
 import type { AmbulanceProfile, ResourceRequest, AmbulanceTrip, AmbulanceTripStatus, AmbulanceVehicle } from '../../types';
 
 export const AmbulanceDashboard: React.FC = () => {
   const { currentUser } = useAuth();
   const [profile, setProfile] = useState<AmbulanceProfile | null>(null);
   const [requests, setRequests] = useState<ResourceRequest[]>([]);
+  const [requestsLoading, setRequestsLoading] = useState(true);
+  const [requestsError, setRequestsError] = useState<string | null>(null);
   const [trips, setTrips] = useState<AmbulanceTrip[]>([]);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
+  const [rejectingReqId, setRejectingReqId] = useState<string | null>(null);
+  const [rejectionReason, setRejectionReason] = useState('');
+  const [respondingReqId, setRespondingReqId] = useState<string | null>(null);
+  const isActionRequired = (status: string) => ['pending', 'assigned', 'requested'].includes(status.toLowerCase());
 
   // New vehicle form state
   const [showAddVehicle, setShowAddVehicle] = useState(false);
@@ -43,7 +50,19 @@ export const AmbulanceDashboard: React.FC = () => {
     if (!currentUser) return;
     loadData();
     const unsubscribeStore = dataStore.subscribe(loadData);
-    const unsubscribeRequests = subscribeRequestsForProviderFromFirestore(currentUser.uid, setRequests);
+    const unsubscribeRequests = subscribeRequestsForProviderFromFirestore(
+      currentUser.uid,
+      (nextRequests) => {
+        setRequests(nextRequests);
+        setRequestsLoading(false);
+        setRequestsError(null);
+      },
+      (message) => {
+        setRequests([]);
+        setRequestsError(message);
+        setRequestsLoading(false);
+      }
+    );
     return () => {
       unsubscribeStore();
       unsubscribeRequests();
@@ -69,22 +88,38 @@ export const AmbulanceDashboard: React.FC = () => {
   };
 
   const handleAcceptRequest = async (reqId: string) => {
+    setRespondingReqId(reqId);
     try {
-      await respondToRequestInFirestore(reqId, 'accepted');
-      setSuccessMessage('Ambulance dispatched! Trip telemetry initiated.');
+      const coordinatorNotified = await respondToRequestInFirestore(reqId, 'accepted');
+      setSuccessMessage(coordinatorNotified
+        ? 'Ambulance request accepted. The coordinator was notified.'
+        : 'Ambulance request accepted. The status is visible in the coordinator live request list.');
       setTimeout(() => setSuccessMessage(null), 3000);
     } catch (error) {
       window.alert(error instanceof Error ? error.message : 'Could not respond to the request.');
+    } finally {
+      setRespondingReqId(null);
     }
   };
 
   const handleRejectRequest = async (reqId: string) => {
+    if (rejectionReason.trim().length < 5) {
+      window.alert('Enter a rejection reason of at least five characters.');
+      return;
+    }
+    setRespondingReqId(reqId);
     try {
-      await respondToRequestInFirestore(reqId, 'rejected', 'All ambulance units engaged in emergency transfers');
-      setSuccessMessage('Request declined.');
+      const coordinatorNotified = await respondToRequestInFirestore(reqId, 'rejected', rejectionReason.trim());
+      setRejectingReqId(null);
+      setRejectionReason('');
+      setSuccessMessage(coordinatorNotified
+        ? 'Ambulance request declined. The coordinator was notified.'
+        : 'Ambulance request declined. The status is visible in the coordinator live request list.');
       setTimeout(() => setSuccessMessage(null), 3000);
     } catch (error) {
       window.alert(error instanceof Error ? error.message : 'Could not respond to the request.');
+    } finally {
+      setRespondingReqId(null);
     }
   };
 
@@ -109,10 +144,16 @@ export const AmbulanceDashboard: React.FC = () => {
   };
 
   if (!profile) {
-    return <div className="p-8 text-center text-slate-500">Loading Ambulance Provider Dashboard...</div>;
+    return (
+      <div className="max-w-7xl mx-auto p-8 space-y-4 text-center text-slate-500">
+        Loading Ambulance Provider Dashboard...
+        {requestsError && <p role="alert" className="text-sm text-red-700">{requestsError}</p>}
+        {currentUser && <ProviderRequestsPanel providerUid={currentUser.uid} title="Assigned Ambulance Requests" />}
+      </div>
+    );
   }
 
-  const pendingRequests = requests.filter((r) => r.status === 'pending');
+  const pendingRequests = requests.filter((r) => isActionRequired(String(r.status)));
   const activeTrips = trips.filter((t) => t.status !== 'completed');
 
   return (
@@ -308,7 +349,11 @@ export const AmbulanceDashboard: React.FC = () => {
               </h2>
             </div>
 
-            {requests.length === 0 ? (
+            {requestsError ? (
+              <div role="alert" className="rounded-lg border border-red-200 bg-red-50 p-3 text-xs text-red-800">{requestsError}</div>
+            ) : requestsLoading ? (
+              <div className="py-8 text-center text-slate-500 text-xs">Loading assigned ambulance requests...</div>
+            ) : requests.length === 0 ? (
               <div className="py-8 text-center text-slate-400 text-xs">
                 No ambulance trip requests received yet.
               </div>
@@ -325,6 +370,9 @@ export const AmbulanceDashboard: React.FC = () => {
                         <span className="text-xs font-mono bg-slate-200 text-slate-700 px-1.5 py-0.5 rounded">
                           {req.caseId}
                         </span>
+                        <span className="text-xs font-bold text-red-800 bg-red-100 px-2 py-0.5 rounded">
+                          Priority: {req.details.urgency || 'Not specified'}
+                        </span>
                         <span className="text-xs font-bold text-amber-800 bg-amber-100 px-2 py-0.5 rounded">
                           {req.details.vehicleType || 'ALS Ambulance'}
                         </span>
@@ -335,27 +383,41 @@ export const AmbulanceDashboard: React.FC = () => {
                       <p className="text-xs text-slate-600">
                         Destination: <strong>{req.details.destinationAddress || 'Assigned Hospital'}</strong>
                       </p>
+                      <p className="mt-1 text-[11px] text-slate-500">
+                        Assigned: {new Date(req.assignedAt || req.createdAt).toLocaleString()}
+                      </p>
+                      {req.respondedAt && (
+                        <p className="mt-1 text-[11px] text-slate-500">
+                          Response {new Date(req.respondedAt).toLocaleString()} by {req.respondedByUid || 'provider'}
+                          {req.responseDetails ? ` - ${req.responseDetails}` : ''}
+                        </p>
+                      )}
                     </div>
 
                     <div className="flex items-center gap-2 self-end sm:self-auto">
-                      {req.status === 'pending' ? (
+                      {isActionRequired(String(req.status)) ? (
                         <>
                           <button
-                            onClick={() => handleRejectRequest(req.requestId)}
+                            disabled={respondingReqId !== null}
+                            onClick={() => {
+                              setRejectionReason('');
+                              setRejectingReqId(req.requestId);
+                            }}
                             className="px-3 py-1.5 text-xs font-bold text-red-600 hover:bg-red-50 rounded-lg border border-red-200"
                           >
                             Decline
                           </button>
                           <button
+                            disabled={respondingReqId !== null}
                             onClick={() => handleAcceptRequest(req.requestId)}
                             className="px-4 py-1.5 text-xs font-bold text-white bg-amber-600 hover:bg-amber-700 rounded-lg shadow-xs flex items-center gap-1"
                           >
-                            <CheckCircle2 className="w-3.5 h-3.5" /> Dispatch Vehicle
+                            <CheckCircle2 className="w-3.5 h-3.5" /> Accept Request
                           </button>
                         </>
                       ) : req.status === 'accepted' ? (
                         <span className="text-xs font-bold text-emerald-700 bg-emerald-100 px-2.5 py-1 rounded-full flex items-center gap-1">
-                          <CheckCircle2 className="w-3.5 h-3.5" /> Dispatched & Tracking
+                          <CheckCircle2 className="w-3.5 h-3.5" /> Accepted
                         </span>
                       ) : (
                         <span className="text-xs font-bold text-red-700 bg-red-100 px-2.5 py-1 rounded-full flex items-center gap-1">
@@ -363,6 +425,30 @@ export const AmbulanceDashboard: React.FC = () => {
                         </span>
                       )}
                     </div>
+                    {rejectingReqId === req.requestId && (
+                      <div className="w-full space-y-2 rounded-lg border border-red-200 bg-red-50 p-3">
+                        <label htmlFor={`ambulance-rejection-${req.requestId}`} className="block text-xs font-semibold text-red-900">
+                          Rejection reason (required)
+                        </label>
+                        <textarea
+                          id={`ambulance-rejection-${req.requestId}`}
+                          required
+                          minLength={5}
+                          rows={2}
+                          value={rejectionReason}
+                          onChange={(event) => setRejectionReason(event.target.value)}
+                          className="w-full rounded-lg border border-red-200 bg-white p-2 text-xs"
+                        />
+                        <div className="flex justify-end gap-2">
+                          <button type="button" disabled={respondingReqId !== null} onClick={() => setRejectingReqId(null)} className="rounded-lg px-3 py-1.5 text-xs text-slate-600 hover:bg-white">
+                            Cancel
+                          </button>
+                          <button type="button" disabled={respondingReqId !== null || rejectionReason.trim().length < 5} onClick={() => handleRejectRequest(req.requestId)} className="rounded-lg bg-red-600 px-3 py-1.5 text-xs font-bold text-white disabled:opacity-50">
+                            {respondingReqId === req.requestId ? 'Saving...' : 'Confirm rejection'}
+                          </button>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 ))}
               </div>

@@ -9,6 +9,7 @@ interface NotificationPanelProps {
   onMarkRead: (id: string) => void;
   onMarkAllRead: () => void;
   onSelectNotification?: (notif: NotificationItem) => void;
+  error?: string | null;
 }
 
 export const NotificationPanel: React.FC<NotificationPanelProps> = ({
@@ -17,7 +18,8 @@ export const NotificationPanel: React.FC<NotificationPanelProps> = ({
   onClose,
   onMarkRead,
   onMarkAllRead,
-  onSelectNotification
+  onSelectNotification,
+  error
 }) => {
   if (!isOpen) return null;
 
@@ -30,8 +32,12 @@ export const NotificationPanel: React.FC<NotificationPanelProps> = ({
         return <Truck className="w-4 h-4 text-amber-500" />;
       case 'request_accepted':
         return <CheckCheck className="w-4 h-4 text-emerald-500" />;
+      case 'request_assigned':
+        return <Activity className="w-4 h-4 text-blue-500" />;
       case 'request_rejected':
         return <AlertTriangle className="w-4 h-4 text-red-500" />;
+      case 'emergency_status_updated':
+        return <Activity className="w-4 h-4 text-teal-600" />;
       case 'provider_verified':
         return <ShieldCheck className="w-4 h-4 text-teal-500" />;
       default:
@@ -72,7 +78,9 @@ export const NotificationPanel: React.FC<NotificationPanelProps> = ({
 
       {/* List */}
       <div className="max-h-96 overflow-y-auto divide-y divide-slate-100">
-        {notifications.length === 0 ? (
+        {error ? (
+          <div role="alert" className="p-4 text-xs text-red-700">{error}</div>
+        ) : notifications.length === 0 ? (
           <div className="py-8 text-center text-slate-400 text-xs">
             <Bell className="w-8 h-8 mx-auto mb-2 opacity-40 text-slate-300" />
             No notifications yet.
@@ -98,16 +106,34 @@ export const NotificationPanel: React.FC<NotificationPanelProps> = ({
                     {notif.title}
                   </p>
                   <span className="text-[10px] text-slate-400 whitespace-nowrap">
-                    {new Date(notif.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                    {new Date(notif.createdAt).toLocaleString([], {
+                      month: 'short',
+                      day: 'numeric',
+                      hour: '2-digit',
+                      minute: '2-digit'
+                    })}
                   </span>
                 </div>
                 <p className="text-xs text-slate-600 line-clamp-2 leading-relaxed">
                   {notif.message}
                 </p>
+                {notif.resourceDetails && (
+                  <p className="mt-1 text-[10px] text-slate-500 line-clamp-2">
+                    {Object.entries(notif.resourceDetails)
+                      .filter(([, value]) => value !== undefined && value !== '')
+                      .map(([key, value]) => `${key.replaceAll(/([A-Z])/g, ' $1')}: ${value}`)
+                      .join(' · ')}
+                  </p>
+                )}
                 {notif.relatedCaseId && (
                   <span className="inline-flex items-center gap-1 mt-1.5 text-[10px] font-mono text-teal-700 bg-teal-100/60 px-1.5 py-0.5 rounded">
-                    Case: {notif.relatedCaseId}
+                    Emergency: {notif.emergencyId || notif.relatedCaseId}
                   </span>
+                )}
+                {notif.eventType && (
+                  <p className="mt-1 text-[10px] text-slate-400 capitalize">
+                    {notif.eventType.replaceAll('_', ' ')}
+                  </p>
                 )}
               </div>
               {!notif.isRead && (
@@ -120,4 +146,3 @@ export const NotificationPanel: React.FC<NotificationPanelProps> = ({
     </div>
   );
 };
-

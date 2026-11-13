@@ -26,7 +26,7 @@ import {
   Send
 } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
-import { dataStore } from '../../services/dataService';
+import { dataStore, getAllowedEmergencyCaseTransitions } from '../../services/dataService';
 import type {
   UserProfile,
   EmergencyCase,
@@ -37,7 +37,9 @@ import type {
   AmbulanceProfile,
   CaseStatus,
   EmergencyPriority,
-  ResourceAssignmentAudit
+  ResourceAssignmentAudit,
+  EmergencyLifecycleEvent,
+  EmergencyLifecycleStatus
 } from '../../types';
 import type { EligibleResourceProvider } from '../../services/dataService';
 
@@ -95,6 +97,12 @@ export const AdminDashboard: React.FC = () => {
   const [isLoadingAssignment, setIsLoadingAssignment] = useState(false);
   const [isSavingAssignment, setIsSavingAssignment] = useState(false);
   const [assignmentError, setAssignmentError] = useState<string | null>(null);
+  const [lifecycleEvents, setLifecycleEvents] = useState<EmergencyLifecycleEvent[]>([]);
+  const [lifecycleLoading, setLifecycleLoading] = useState(false);
+  const [lifecycleError, setLifecycleError] = useState<string | null>(null);
+  const [nextLifecycleStatus, setNextLifecycleStatus] = useState<EmergencyLifecycleStatus | ''>('');
+  const [lifecycleReason, setLifecycleReason] = useState('');
+  const [isSavingLifecycleStatus, setIsSavingLifecycleStatus] = useState(false);
 
   // Selected Case for Details & Assignment Modal
   const [selectedCase, setSelectedCase] = useState<EmergencyCase | null>(null);
@@ -233,6 +241,63 @@ export const AdminDashboard: React.FC = () => {
       unsubscribe();
     };
   }, [assignmentRequest, coordinatorCases]);
+
+  useEffect(() => {
+    if (!selectedCase) {
+      setLifecycleEvents([]);
+      return;
+    }
+    let active = true;
+    setLifecycleLoading(true);
+    setLifecycleError(null);
+    void dataStore.getEmergencyTimelineFromFirestore(selectedCase.caseId)
+      .then((events) => {
+        if (active) setLifecycleEvents(events);
+      })
+      .catch((error) => {
+        if (active) setLifecycleError(error instanceof Error ? error.message : 'Could not load the emergency timeline.');
+      })
+      .finally(() => {
+        if (active) setLifecycleLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [selectedCase?.caseId, coordinatorRequests]);
+
+  useEffect(() => {
+    if (!selectedCase) return;
+    const latestCase = coordinatorCases.find((emergencyCase) => emergencyCase.caseId === selectedCase.caseId);
+    if (latestCase && latestCase.status !== selectedCase.status) {
+      setSelectedCase((current) => current && current.caseId === latestCase.caseId
+        ? { ...current, status: latestCase.status }
+        : current);
+    }
+  }, [coordinatorCases, selectedCase?.caseId, selectedCase?.status]);
+
+  const handleLifecycleTransition = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!selectedCase || !nextLifecycleStatus) return;
+    setIsSavingLifecycleStatus(true);
+    setLifecycleError(null);
+    try {
+      await dataStore.transitionEmergencyCaseStatus(
+        selectedCase.caseId,
+        nextLifecycleStatus,
+        lifecycleReason
+      );
+      setSelectedCase((current) => current
+        ? { ...current, status: nextLifecycleStatus }
+        : current);
+      setNextLifecycleStatus('');
+      setLifecycleReason('');
+      setLifecycleEvents(await dataStore.getEmergencyTimelineFromFirestore(selectedCase.caseId));
+    } catch (error) {
+      setLifecycleError(error instanceof Error ? error.message : 'The emergency status could not be updated.');
+    } finally {
+      setIsSavingLifecycleStatus(false);
+    }
+  };
 
   const handleConfirmAssignment = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -793,7 +858,7 @@ export const AdminDashboard: React.FC = () => {
                       className="w-full px-3.5 py-2 rounded-xl bg-[#00707E] hover:bg-[#005B66] text-white text-xs font-bold shadow-xs transition-colors flex items-center justify-center gap-1.5"
                     >
                       <Sliders className="w-3.5 h-3.5" />
-                      <span>{c.assignedHospitalUid ? 'Reassign Providers' : 'Assign & Dispatch'}</span>
+                      <span>{c.assignedHospitalUid ? 'Reassign Providers' : 'Assign Providers'}</span>
                     </button>
 
                     <button
@@ -1340,7 +1405,7 @@ export const AdminDashboard: React.FC = () => {
                   className="px-5 py-2.5 bg-[#00707E] hover:bg-[#005B66] text-white text-xs font-bold rounded-xl shadow-xs flex items-center gap-2"
                 >
                   <Send className="w-3.5 h-3.5" />
-                  <span>Dispatch & Notify Providers</span>
+                  <span>Assign & Notify Providers</span>
                 </button>
               </div>
             </form>
@@ -1369,26 +1434,87 @@ export const AdminDashboard: React.FC = () => {
               </button>
             </div>
 
-            <div className="space-y-3">
-              {(selectedCase.auditHistory || []).length === 0 ? (
-                <div className="text-xs text-slate-500 py-4 text-center">No audit records logged yet.</div>
+            <section className="rounded-xl border border-purple-100 bg-purple-50/60 p-4 space-y-3">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <h4 className="text-xs font-bold uppercase tracking-wide text-purple-900">Overall emergency status</h4>
+                  <p className="text-sm font-bold text-slate-900 mt-1">{String(selectedCase.status).replaceAll('_', ' ')}</p>
+                </div>
+                <span className="text-[10px] text-slate-500">Coordinator-managed</span>
+              </div>
+              {getAllowedEmergencyCaseTransitions(String(selectedCase.status)).length > 0 ? (
+                <form onSubmit={handleLifecycleTransition} className="grid gap-2 sm:grid-cols-[1fr_1.5fr_auto] items-end">
+                  <label className="text-[11px] font-semibold text-slate-700">
+                    Next status
+                    <select
+                      required
+                      value={nextLifecycleStatus}
+                      onChange={(event) => setNextLifecycleStatus(event.target.value as EmergencyLifecycleStatus)}
+                      className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-2.5 py-2 text-xs"
+                    >
+                      <option value="">Select status</option>
+                      {getAllowedEmergencyCaseTransitions(String(selectedCase.status)).map((status) => (
+                        <option key={status} value={status}>{status.replaceAll('_', ' ')}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="text-[11px] font-semibold text-slate-700">
+                    Reason {nextLifecycleStatus === 'REJECTED' || nextLifecycleStatus === 'CANCELLED' ? '(required)' : '(optional)'}
+                    <input
+                      value={lifecycleReason}
+                      onChange={(event) => setLifecycleReason(event.target.value)}
+                      required={nextLifecycleStatus === 'REJECTED' || nextLifecycleStatus === 'CANCELLED'}
+                      minLength={nextLifecycleStatus === 'REJECTED' || nextLifecycleStatus === 'CANCELLED' ? 5 : undefined}
+                      placeholder="Add transition context"
+                      className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-2.5 py-2 text-xs"
+                    />
+                  </label>
+                  <button
+                    type="submit"
+                    disabled={isSavingLifecycleStatus || !nextLifecycleStatus}
+                    className="rounded-lg bg-purple-700 px-3 py-2 text-xs font-bold text-white disabled:opacity-50"
+                  >
+                    {isSavingLifecycleStatus ? 'Saving…' : 'Update status'}
+                  </button>
+                </form>
               ) : (
-                (selectedCase.auditHistory || []).map((audit, idx) => (
-                  <div key={audit.id || idx} className="p-3 rounded-xl bg-slate-50 border border-slate-100 space-y-1">
-                    <div className="flex items-center justify-between text-xs">
-                      <span className="font-bold text-slate-800">{audit.status}</span>
-                      <span className="text-[11px] text-slate-400">
-                        {new Date(audit.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} • {new Date(audit.timestamp).toLocaleDateString()}
-                      </span>
-                    </div>
-                    <div className="text-xs text-slate-600">{audit.note || 'Status transitioned'}</div>
-                    <div className="text-[11px] text-slate-400">
-                      Updated by: <span className="font-medium text-slate-700">{audit.updatedByName}</span> ({audit.role})
-                    </div>
-                  </div>
-                ))
+                <p className="text-xs text-slate-600">This emergency is in a terminal lifecycle state.</p>
               )}
-            </div>
+              {lifecycleError && <p role="alert" className="text-xs text-red-700">{lifecycleError}</p>}
+            </section>
+
+            <section className="space-y-3">
+              <h4 className="text-xs font-bold uppercase tracking-wide text-slate-700">Complete emergency timeline</h4>
+              {lifecycleLoading ? (
+                <p role="status" className="py-4 text-center text-xs text-slate-500">Loading timeline…</p>
+              ) : lifecycleEvents.length === 0 ? (
+                <p className="py-4 text-center text-xs text-slate-500">No lifecycle or assignment events recorded yet.</p>
+              ) : (
+                <div className="space-y-2">
+                  {[...lifecycleEvents].reverse().map((entry) => (
+                    <article key={`${entry.eventType}-${entry.eventId}`} className="rounded-xl border border-slate-100 bg-slate-50 p-3 space-y-1">
+                      <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                        <span className="font-bold text-slate-800">
+                          {entry.eventType === 'assignment'
+                            ? `${entry.previousProviderName || 'Unassigned'} → ${entry.newProviderName || 'Provider'}`
+                            : `${entry.previousStatus.replaceAll('_', ' ')} → ${entry.newStatus.replaceAll('_', ' ')}`}
+                        </span>
+                        <time className="text-[11px] text-slate-500">{formatDate(entry.timestamp)}</time>
+                      </div>
+                      {entry.requestId && (
+                        <p className="text-[11px] text-slate-600">
+                          {entry.resourceType || 'Resource'} request {entry.requestId}
+                        </p>
+                      )}
+                      <p className="text-[11px] text-slate-500">
+                        Updated by UID {entry.updatedByUid} ({entry.userRole})
+                      </p>
+                      {entry.reason && <p className="text-[11px] text-slate-600">Reason: {entry.reason}</p>}
+                    </article>
+                  ))}
+                </div>
+              )}
+            </section>
           </div>
         </div>
       )}
